@@ -1,4 +1,4 @@
-const { Client, RemoteAuth } = require('whatsapp-web.js');
+const { Client, RemoteAuth, MessageMedia } = require('whatsapp-web.js');
 const { MongoStore } = require('wwebjs-mongo');
 const mongoose = require('mongoose');
 const express = require('express');
@@ -6,123 +6,114 @@ const QRCode = require('qrcode');
 const axios = require('axios');
 const app = express();
 
-app.use(express.json());
+// Increase limit for heavy media
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
-const MONGO_URI = process.env.MONGO_URI;
+const MONGO_URI = process.env.MONGO_URI; // Make sure this is set in Render
 const QR_PASSWORD = process.env.QR_PASSWORD || "agartha_secret";
 const N8N_WEBHOOK = process.env.N8N_WEBHOOK;
 
-// --- 1. FAKE WEBSITE (The Camouflage) ---
-app.get('/', (req, res) => {
-    res.send(`
-        <html>
-            <head><title>System Status</title></head>
-            <body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#f0f2f5;font-family:Arial;">
-                <div style="text-align:center;">
-                    <h1>🚧 System Maintenance 🚧</h1>
-                    <p>Our servers are currently updating. Please try again later.</p>
-                </div>
-            </body>
-        </html>
-    `);
-});
+// --- 1. FAKE MAINTENANCE PAGE ---
+app.get('/', (req, res) => res.send("<html><body><h1>🚧 System Maintenance 🚧</h1></body></html>"));
 
 // --- 2. DATABASE & BOT SETUP ---
 let client;
 let currentQR = null;
 
+// Connect to Mongo
 mongoose.connect(MONGO_URI).then(() => {
     console.log('✅ Connected to MongoDB');
-    
     const store = new MongoStore({ mongoose: mongoose });
     
     client = new Client({
-        authStrategy: new RemoteAuth({
-            store: store,
-            backupSyncIntervalMs: 300000 // Save session every 5 mins
-        }),
-        puppeteer: {
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
-        }
+        authStrategy: new RemoteAuth({ store: store, backupSyncIntervalMs: 300000 }),
+        puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] }
     });
 
-    client.on('qr', (qr) => {
-        console.log('🆕 New QR Code generated');
-        currentQR = qr;
-    });
+    client.on('qr', (qr) => { currentQR = qr; });
+    client.on('ready', () => { console.log('🚀 WhatsApp Ready!'); currentQR = "connected"; });
 
-    client.on('ready', () => {
-        console.log('🚀 WhatsApp Client is Ready!');
-        currentQR = "connected";
-    });
-
+    // --- INBOUND (Receive) ---
     client.on('message', async (msg) => {
         if (!N8N_WEBHOOK) return;
 
-        // Clean the ID slightly for easier reading, but keep important parts
-        // If it's a standard number, remove @c.us. If it's LID or Group, keep it.
+        // Clean ID logic
         const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
+        
+        let attachment = null;
 
-        console.log(`📩 Forwarding message from ${cleanFrom} to Brain...`);
+        // Check for ANY Media (Voice, Image, Video, PDF)
+        if (msg.hasMedia) {
+            try {
+                const media = await msg.downloadMedia();
+                if(media) {
+                    attachment = {
+                        mimetype: media.mimetype,
+                        data: media.data, // Base64
+                        filename: media.filename || "unknown_file"
+                    };
+                }
+            } catch (err) { console.error("Media Download Failed:", err.message); }
+        }
 
+        console.log(`📩 From ${cleanFrom} | Media: ${msg.hasMedia ? "YES" : "NO"}`);
+
+        // Send to n8n
         try {
             await axios.post(N8N_WEBHOOK, {
-                from: msg.from, // Send the FULL ID (including @lid or @c.us) to be safe
+                from: msg.from,
                 body: msg.body,
                 name: msg._data.notifyName || "Unknown",
-                timestamp: msg.timestamp
+                timestamp: msg.timestamp,
+                attachment: attachment // n8n receives this
             });
-        } catch(e) { 
-            console.error("❌ Failed to send to Brain:", e.message); 
-        }
+        } catch(e) { console.error("❌ Brain Error:", e.message); }
     });
 
     client.initialize();
 });
 
-// --- 3. SECRET QR PAGE ---
+// --- 3. CONNECT PAGE ---
 app.get('/connect', async (req, res) => {
-    const pwd = req.query.password;
-    if(pwd !== QR_PASSWORD) return res.status(403).send("⛔ Access Denied");
-
-    if(currentQR === "connected") return res.send("<h1>✅ Bot is already connected!</h1>");
-    if(!currentQR) return res.send("<h1>⏳ Booting up... Refresh in 10s</h1>");
-
+    if(req.query.password !== QR_PASSWORD) return res.status(403).send("⛔");
+    if(currentQR === "connected") return res.send("✅ Connected");
+    if(!currentQR) return res.send("⏳ Booting...");
     const qrImage = await QRCode.toDataURL(currentQR);
-    res.send(`
-        <html><body style="text-align:center; padding-top:50px;">
-            <h1>Scan with WhatsApp</h1>
-            <img src="${qrImage}" />
-            <p>Refresh if this expires.</p>
-        </body></html>
-    `);
+    res.send(`<img src="${qrImage}" />`);
 });
 
-// --- 4. SEND MESSAGE API (THE FIX IS HERE) ---
+// --- 4. OUTBOUND (Send) ---
 app.post('/send', async (req, res) => {
-    // Security check
-    const authHeader = req.headers['authorization'];
-    if(!authHeader || authHeader !== `Bearer ${QR_PASSWORD}`) {
-        return res.status(401).json({error: "Unauthorized"});
-    }
+    if(req.headers['authorization'] !== `Bearer ${QR_PASSWORD}`) return res.status(401).json({error: "Unauthorized"});
 
-    const { number, message } = req.body;
+    const { number, message, attachment } = req.body;
+    if (!number) return res.status(400).json({error: "No number provided"});
 
-    if (!number || !message) {
-        return res.status(400).json({error: "Missing number or message"});
-    }
-    
     try {
-        // 🛠️ SMART ID FIX:
-        // If the number already has '@c.us', '@lid', or '@g.us', don't change it.
-        // If it's just digits (e.g. 9198...), add '@c.us'.
         const chatId = number.includes('@') ? number : number.replace('+', '') + "@c.us";
         
-        await client.sendMessage(chatId, message);
-        console.log(`📤 Sent reply to ${chatId}`);
+        // --- SEND MEDIA (Image/Audio/Doc) ---
+        if (attachment && attachment.data) {
+            const media = new MessageMedia(attachment.mimetype, attachment.data, attachment.filename);
+            
+            // 🎤 MAGIC SWITCH: If it's audio, send as Voice Note (waveform)
+            const isAudio = attachment.mimetype.startsWith('audio');
+            
+            await client.sendMessage(chatId, media, { 
+                caption: message || "",
+                sendAudioAsVoice: isAudio // <--- THIS MAKES IT REAL
+            });
+            console.log(`📤 Sent MEDIA (${attachment.mimetype}) to ${chatId}`);
+        
+        // --- SEND TEXT ONLY ---
+        } else {
+            await client.sendMessage(chatId, message);
+            console.log(`📤 Sent TEXT to ${chatId}`);
+        }
+        
         res.json({status: "sent"});
     } catch(e) {
         console.error("❌ Send Error:", e.toString());
