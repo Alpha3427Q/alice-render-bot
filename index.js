@@ -23,6 +23,7 @@ function checkMemoryHealth() {
     console.log(`🧠 RAM Usage: ${Math.round(used)} MB`);
 
     // ⚠️ TRIGGER: Only restart if we are critically close to the 512MB cliff.
+    // Adjusted to 470MB as requested.
     if (used > 470) {
         console.warn("⚠️ Memory Critical (>470MB)! Restarting to prevent crash...");
         process.exit(1);
@@ -41,7 +42,7 @@ mongoose.connect(MONGO_URI).then(() => {
 
     client = new Client({
         authStrategy: new RemoteAuth({ store: store, backupSyncIntervalMs: 300000 }),
-        // 🛠️ CRITICAL PUPPETEER FIXES FOR RENDER
+        // 🛠️ LOW RAM ARGS & TIMEOUTS
         puppeteer: {
             headless: true,
             args: [
@@ -51,25 +52,26 @@ mongoose.connect(MONGO_URI).then(() => {
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
                 '--no-zygote',
-                '--single-process', // ⚠️ Important for Render memory limits
+                '--single-process',
                 '--disable-gpu'
             ],
-            // ⚠️ TIMEOUT FIXES: Prevents "ProtocolError"
-            timeout: 60000,          // 60 Seconds (Browser Launch Timeout)
-            protocolTimeout: 120000  // 120 Seconds (Page Load/Inject Timeout)
+            // ⚠️ Keeping these is CRITICAL for the bot to boot on Render
+            timeout: 60000,
+            protocolTimeout: 120000
         }
     });
 
     client.on('qr', (qr) => { currentQR = qr; });
     client.on('ready', () => { console.log('🚀 WhatsApp Ready!'); currentQR = "connected"; });
 
-    // --- INBOUND (Receive) ---
+    // --- INBOUND (Receive) - 100% Compatible with your n8n ---
     client.on('message', async (msg) => {
         if (!N8N_WEBHOOK) return;
 
         const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         let attachment = null;
 
+        // Identical logic to your original code
         if (msg.hasMedia) {
             try {
                 const media = await msg.downloadMedia();
@@ -87,6 +89,7 @@ mongoose.connect(MONGO_URI).then(() => {
         console.log(`📩 From ${cleanFrom} | Media: ${msg.hasMedia ? "YES" : "NO"}`);
 
         try {
+            // Sends exact same structure to n8n
             await axios.post(N8N_WEBHOOK, {
                 from: msg.from,
                 body: msg.body,
@@ -97,6 +100,7 @@ mongoose.connect(MONGO_URI).then(() => {
             attachment = null; // Cleanup
         } catch(e) { console.error("❌ Brain Error:", e.message); }
 
+        // Check RAM status only after work is done
         checkMemoryHealth();
     });
 
@@ -112,7 +116,7 @@ app.get('/connect', async (req, res) => {
     res.send(`<img src="${qrImage}" />`);
 });
 
-// --- 5. OUTBOUND (Send) - WITH CRASH GUARD 🛡️ ---
+// --- 5. OUTBOUND (Send) ---
 app.post('/send', async (req, res) => {
     if(req.headers['authorization'] !== `Bearer ${QR_PASSWORD}`) return res.status(401).json({error: "Unauthorized"});
 
@@ -122,8 +126,10 @@ app.post('/send', async (req, res) => {
     try {
         const chatId = number.includes('@') ? number : number.replace('+', '') + "@c.us";
 
+        // Logic matches your original requirements exactly
         if (attachment && attachment.data) {
-            console.log(`📤 Sending Media...`);
+            console.log(`📤 Sending ${attachment.mimetype}...`);
+
             let media = new MessageMedia(attachment.mimetype, attachment.data, attachment.filename);
             const isAudio = attachment.mimetype.startsWith('audio');
 
@@ -131,30 +137,28 @@ app.post('/send', async (req, res) => {
                 caption: message || "",
                 sendAudioAsVoice: isAudio
             });
+            console.log(`✅ Sent MEDIA to ${chatId}`);
+
+            // Aggressive Cleanup
+            media = null;
+            attachment.data = null;
+            attachment = null;
+            req.body = null;
+
         } else {
             await client.sendMessage(chatId, message);
+            console.log(`✅ Sent TEXT to ${chatId}`);
         }
-        
-        console.log(`✅ Sent to ${chatId}`);
-        
-        // 🛡️ SUCCESS: Clean up and respond
-        if(attachment) { attachment.data = null; attachment = null; }
-        req.body = null;
+
         res.json({status: "sent"});
 
     } catch(e) {
-        const errorMsg = e.toString();
-        
-        // 🛡️ CRASH GUARD: IGNORE "markedUnread" ERROR
-        // This is the magic line that fixes your n8n error.
-        if (errorMsg.includes('markedUnread')) {
-            console.warn("⚠️ Library bug ignored (markedUnread). Message likely sent.");
-            return res.json({status: "sent", note: "Handled internal bug"});
-        }
-
-        console.error("❌ Send Error:", errorMsg);
-        res.status(500).json({error: errorMsg});
+        // ❌ NO CRASH GUARD HERE.
+        // This will send a 500 error to n8n if the library fails.
+        console.error("❌ Send Error:", e.toString());
+        res.status(500).json({error: e.toString()});
     } finally {
+        // Final Safety Check
         checkMemoryHealth();
     }
 });
