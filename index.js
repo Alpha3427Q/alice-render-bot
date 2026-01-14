@@ -12,7 +12,7 @@ app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
 const PORT = process.env.PORT || 3000;
-const MONGO_URI = process.env.MONGO_URI; 
+const MONGO_URI = process.env.MONGO_URI;
 const QR_PASSWORD = process.env.QR_PASSWORD || "agartha_secret";
 const N8N_WEBHOOK = process.env.N8N_WEBHOOK;
 
@@ -26,7 +26,7 @@ function checkMemoryHealth() {
     // Adjusted to 470MB as requested.
     if (used > 470) {
         console.warn("⚠️ Memory Critical (>470MB)! Restarting to prevent crash...");
-        process.exit(1); 
+        process.exit(1);
     }
 }
 
@@ -42,18 +42,22 @@ mongoose.connect(MONGO_URI).then(() => {
 
     client = new Client({
         authStrategy: new RemoteAuth({ store: store, backupSyncIntervalMs: 300000 }),
-        // 🛠️ LOW RAM ARGS: These are safe and help keep usage low
-        puppeteer: { 
-            headless: true, 
+        // 🛠️ CRITICAL PUPPETEER FIXES FOR RENDER
+        puppeteer: {
+            headless: true,
             args: [
-                '--no-sandbox', 
+                '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage', // Writes temp data to disk, saves RAM
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
                 '--no-zygote',
+                '--single-process', // ⚠️ Important for Render memory limits
                 '--disable-gpu'
-            ] 
+            ],
+            // ⚠️ TIMEOUT FIXES: Prevents "ProtocolError: Runtime.callFunctionOn timed out"
+            timeout: 60000,          // 60 Seconds (Browser Launch Timeout)
+            protocolTimeout: 120000  // 120 Seconds (Page Load/Inject Timeout)
         }
     });
 
@@ -74,7 +78,7 @@ mongoose.connect(MONGO_URI).then(() => {
                 if(media) {
                     attachment = {
                         mimetype: media.mimetype,
-                        data: media.data, 
+                        data: media.data,
                         filename: media.filename || "unknown_file"
                     };
                 }
@@ -125,7 +129,7 @@ app.post('/send', async (req, res) => {
         // Logic matches your original requirements exactly
         if (attachment && attachment.data) {
             console.log(`📤 Sending ${attachment.mimetype}...`);
-            
+
             let media = new MessageMedia(attachment.mimetype, attachment.data, attachment.filename);
             const isAudio = attachment.mimetype.startsWith('audio');
 
@@ -137,9 +141,9 @@ app.post('/send', async (req, res) => {
 
             // Aggressive Cleanup
             media = null;
-            attachment.data = null; 
+            attachment.data = null;
             attachment = null;
-            req.body = null; 
+            req.body = null;
 
         } else {
             await client.sendMessage(chatId, message);
