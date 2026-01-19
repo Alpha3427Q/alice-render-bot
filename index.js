@@ -35,12 +35,11 @@ mongoose.connect(MONGO_URI).then(() => {
     const store = new MongoStore({ mongoose: mongoose });
 
     client = new Client({
-        // 🔐 Session Management
+        // 👇 SESSION FIX: "Login Once" Settings 👇
         authStrategy: new RemoteAuth({ 
-            clientId: 'Alice_Fixed', // New ID to ensure a clean start
+            clientId: 'Alice_Permanent', // Static name so it always finds your session
             store: store, 
-            // 👇 FIX FOR QR LOOP: Save every 60s (1 min) instead of 5 mins
-            backupSyncIntervalMs: 60000 
+            backupSyncIntervalMs: 60000 // Save every 60s (Fixes the loop!)
         }),
         
         // 🕵️ User Agent Spoofing (Your preferred setting)
@@ -70,11 +69,14 @@ mongoose.connect(MONGO_URI).then(() => {
         }
     });
 
-    client.on('qr', (qr) => { currentQR = qr; });
+    client.on('qr', (qr) => { 
+        console.log("📌 QR Code Received (Scan needed)");
+        currentQR = qr; 
+    });
     
-    // Log when session is saved so you know it's working
+    // Log when session is saved so you know it worked
     client.on('remote_session_saved', () => {
-        console.log("💾 Session Saved!");
+        console.log("💾 Login Saved to Database!");
     });
 
     client.on('ready', () => { console.log('🚀 WhatsApp Ready!'); currentQR = "connected"; });
@@ -85,29 +87,19 @@ mongoose.connect(MONGO_URI).then(() => {
 
         const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         
-        // 👇👇👇 BLUE TICK FIX IS HERE 👇👇👇
+        // 👇 BLUE TICK FIX (With Delays) 👇
         try {
             const chat = await msg.getChat();
             
-            // 1. Clear previous state
             await chat.clearState();
-            
-            // 2. WAIT 500ms (Crucial Fix: Prevents WhatsApp ignoring the command)
-            await new Promise(resolve => setTimeout(resolve, 500));
-            
-            // 3. Send Blue Tick
+            await new Promise(resolve => setTimeout(resolve, 500)); // Delay 1
             await chat.sendSeen();
-            
-            // 4. WAIT 300ms (Crucial Fix: Human-like pause)
-            await new Promise(resolve => setTimeout(resolve, 300));
-            
-            // 5. Start typing
+            await new Promise(resolve => setTimeout(resolve, 300)); // Delay 2
             await chat.sendStateTyping(); 
             
         } catch (e) {
             console.error("⚠️ Status Error:", e.message);
         }
-        // 👆👆👆 END FIX 👆👆👆
 
         let attachment = null;
 
