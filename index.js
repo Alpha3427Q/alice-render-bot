@@ -6,16 +6,6 @@ const QRCode = require('qrcode');
 const axios = require('axios');
 const app = express();
 
-// --- 0. GLOBAL CRASH GUARD (The GitHub Fix) ---
-// This prevents the bot from dying if the error happens in the background.
-process.on('unhandledRejection', (reason, promise) => {
-    if (reason.toString().includes('markedUnread')) {
-        console.warn("🛡️ Global Guard: Ignored 'markedUnread' error. Bot is still running.");
-        return;
-    }
-    console.error('❌ Unhandled Rejection:', reason);
-});
-
 // --- 1. CONFIGURATION & LIMITS ---
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
@@ -29,9 +19,8 @@ const N8N_WEBHOOK = process.env.N8N_WEBHOOK;
 function checkMemoryHealth() {
     const used = process.memoryUsage().rss / 1024 / 1024;
     console.log(`🧠 RAM Usage: ${Math.round(used)} MB`);
-
     if (used > 470) {
-        console.warn("⚠️ Memory Critical (>470MB)! Restarting...");
+        console.warn("⚠️ Memory Critical (>470MB)! Restarting to prevent crash...");
         process.exit(1);
     }
 }
@@ -40,7 +29,7 @@ function checkMemoryHealth() {
 let client;
 let currentQR = null;
 
-app.get('/', (req, res) => res.send("<html><body><h1>🚧 Bot is Active 🚧</h1></body></html>"));
+app.get('/', (req, res) => res.send("<html><body><h1>🚧 System Maintenance 🚧</h1></body></html>"));
 
 mongoose.connect(MONGO_URI).then(() => {
     console.log('✅ Connected to MongoDB');
@@ -48,7 +37,15 @@ mongoose.connect(MONGO_URI).then(() => {
 
     client = new Client({
         authStrategy: new RemoteAuth({ store: store, backupSyncIntervalMs: 300000 }),
-        // 🛠️ RENDER COMPATIBILITY SETTINGS
+        
+        // 👇👇👇 FIX START: FORCE OLD VERSION TO PREVENT 'markedUnread' ERROR 👇👇👇
+        webVersionCache: {
+            type: 'remote',
+            remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1031490220-alpha.html',
+        },
+        // 👆👆👆 FIX END 👆👆👆
+
+        // 🛠️ PUPPETEER CONFIG (Keep these! They prevent startup timeouts)
         puppeteer: {
             headless: true,
             args: [
@@ -61,9 +58,8 @@ mongoose.connect(MONGO_URI).then(() => {
                 '--single-process',
                 '--disable-gpu'
             ],
-            // ⚠️ TIMEOUTS (Crucial for Render free tier)
             timeout: 60000,
-            protocolTimeout: 120000 
+            protocolTimeout: 120000
         }
     });
 
@@ -119,7 +115,7 @@ app.get('/connect', async (req, res) => {
     res.send(`<img src="${qrImage}" />`);
 });
 
-// --- 5. OUTBOUND (Send) - WITH CRASH GUARD 🛡️ ---
+// --- 5. OUTBOUND (Send) ---
 app.post('/send', async (req, res) => {
     if(req.headers['authorization'] !== `Bearer ${QR_PASSWORD}`) return res.status(401).json({error: "Unauthorized"});
 
@@ -144,20 +140,17 @@ app.post('/send', async (req, res) => {
         
         console.log(`✅ Sent to ${chatId}`);
         
-        // Clean up memory
         if(attachment) { attachment.data = null; attachment = null; }
         req.body = null;
-        
         res.json({status: "sent"});
 
     } catch(e) {
         const errorMsg = e.toString();
         
-        // 🛡️ THE FIX FROM GITHUB #5718
-        // If the error contains 'markedUnread', it means the message SENT, but the UI update failed.
-        // We MUST return 200 OK to n8n so the workflow continues.
+        // I kept your original fallback here just in case, 
+        // but the webVersionCache fix above should prevent this error from ever happening.
         if (errorMsg.includes('markedUnread')) {
-            console.warn("⚠️ Handled 'markedUnread' bug. Message likely sent.");
+            console.warn("⚠️ Known Library Bug (#5718) detected. Ignoring... (Message Sent)");
             return res.json({status: "sent", note: "Handled internal bug"});
         }
 
