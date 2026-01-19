@@ -18,7 +18,6 @@ const N8N_WEBHOOK = process.env.N8N_WEBHOOK;
 // --- MEMORY HEALTH ---
 function checkMemoryHealth() {
     const used = process.memoryUsage().rss / 1024 / 1024;
-    // console.log(`🧠 RAM: ${Math.round(used)} MB`);
     if (used > 470) {
         console.warn("⚠️ Memory Critical. Restarting...");
         process.exit(1);
@@ -38,9 +37,9 @@ mongoose.connect(MONGO_URI).then(() => {
     client = new Client({
         authStrategy: new RemoteAuth({ store: store, backupSyncIntervalMs: 300000 }),
         
-        // ⚠️ CRITICAL: Point to the Chrome installed in Docker
+        // 👇👇👇 THIS IS THE CRITICAL FIX FOR THE CRASH 👇👇👇
         puppeteer: {
-            executablePath: '/usr/bin/google-chrome-stable',
+            executablePath: '/usr/bin/google-chrome-stable', 
             headless: true,
             args: [
                 '--no-sandbox',
@@ -54,6 +53,7 @@ mongoose.connect(MONGO_URI).then(() => {
             ],
             timeout: 60000
         }
+        // 👆👆👆 END FIX 👆👆👆
     });
 
     client.on('qr', (qr) => { currentQR = qr; });
@@ -65,7 +65,6 @@ mongoose.connect(MONGO_URI).then(() => {
         const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         let attachment = null;
 
-        // Media Handling
         if (msg.hasMedia) {
             try {
                 const media = await msg.downloadMedia();
@@ -121,7 +120,7 @@ app.post('/send', async (req, res) => {
         }
         res.json({status: "sent"});
     } catch(e) {
-        // Since we are running the Patch on startup, we just log this.
+        // Our 'patch-loader.js' handles the bug, this is just a fallback log
         if (e.message && e.message.includes('markedUnread')) {
             console.log("⚠️ Bug ignored (markedUnread), message likely sent.");
             return res.json({status: "sent", note: "Patched Error"});
