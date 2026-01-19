@@ -7,33 +7,21 @@ const axios = require('axios');
 const app = express();
 
 // --- CONFIGURATION ---
-app.use(express.json({ limit: '50mb' })); // Reduced limit to save RAM
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI;
 const QR_PASSWORD = process.env.QR_PASSWORD || "agartha_secret";
 const N8N_WEBHOOK = process.env.N8N_WEBHOOK;
 
-// --- MEMORY HEALTH ---
-// Tighter limit: Restart at 400MB to avoid crashing the whole container
-function checkMemoryHealth() {
-    const used = process.memoryUsage().rss / 1024 / 1024;
-    if (used > 400) {
-        console.warn(`⚠️ Memory Warning: ${Math.round(used)}MB used. Restarting to clear RAM...`);
-        process.exit(1);
-    }
-}
-
-// Garbage Collection: Run manually if exposed (optional but helps)
-if (global.gc) {
-    setInterval(() => { global.gc(); }, 30000);
-}
+// TIMESTAMP: Ignore messages from before the bot started (Saves RAM)
+const BOOT_TIMESTAMP = Math.floor(Date.now() / 1000);
 
 let client;
 let currentQR = null;
 
-app.get('/', (req, res) => res.send("<html><body><h1>System Online</h1></body></html>"));
+app.get('/', (req, res) => res.send("<html><body><h1>🟢 System Online</h1></body></html>"));
 
 // --- DATABASE & CLIENT ---
 mongoose.connect(MONGO_URI).then(() => {
@@ -41,67 +29,84 @@ mongoose.connect(MONGO_URI).then(() => {
     const store = new MongoStore({ mongoose: mongoose });
 
     client = new Client({
-        // 🔐 SESSION FIX: Save faster & keep ID static
+        // 👇👇👇 EMERGENCY SAVE SETTINGS 👇👇👇
         authStrategy: new RemoteAuth({ 
-            clientId: 'Alice_Main_V1', // Permanent ID
+            clientId: 'Alice_Final_Persistent', // New ID
             store: store, 
-            backupSyncIntervalMs: 60000 // Save every 60s (Fixes "Scan Again" loop)
+            // ⚠️ EXTREME SETTING: Try to save every 10 seconds.
+            // This ensures we catch the session data before the crash happens.
+            backupSyncIntervalMs: 10000 
         }),
-        
+        // 👆👆👆 END FIX 👆👆👆
+
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36',
 
-        // 🛡️ RAM OPTIMIZATION SETTINGS
         puppeteer: {
             executablePath: '/usr/bin/google-chrome-stable',
             headless: true,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage', // Memory handling
+                '--disable-dev-shm-usage',
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
                 '--no-zygote',
-                '--single-process', // Critical for low RAM envs
+                '--single-process', 
                 '--disable-gpu',
                 '--disable-extensions',
                 '--disable-software-rasterizer',
                 '--mute-audio',
-                // 👇 Block heavy content to save RAM
-                '--disable-gl-drawing-for-tests',
-                '--window-size=800,600', // Smaller window uses less RAM
+                // RAM Optimizations
+                '--disable-features=site-per-process', 
+                '--renderer-process-limit=1', 
+                '--window-size=800,600',
                 '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
             ],
             timeout: 60000
         }
     });
 
-    // Debug Log: Confirm session restoration
+    // Debug Logs for Saving
     client.on('remote_session_saved', () => {
-        console.log("💾 Session Saved to MongoDB");
+        console.log("💾 SUCCESS: Session saved to MongoDB! (You are safe now)");
     });
 
-    client.on('qr', (qr) => { currentQR = qr; console.log("📌 Scan QR Code"); });
-    client.on('ready', () => { console.log('🚀 WhatsApp Ready!'); currentQR = "connected"; });
+    client.on('qr', (qr) => { 
+        console.log("📌 QR Code Received");
+        currentQR = qr; 
+    });
+    
+    client.on('ready', async () => { 
+        console.log('🚀 WhatsApp Ready!'); 
+        currentQR = "connected"; 
+        
+        // 👇 MANUALLY FORCE STORAGE UPDATE IF POSSIBLE
+        // (We rely on the 10s timer, but this log confirms we reached this state)
+        console.log("⏳ Attempting to survive long enough to save...");
+    });
 
     // --- INBOUND MESSAGE HANDLING ---
     client.on('message', async (msg) => {
-        if (!N8N_WEBHOOK) return;
+        // 1. Ignore History (Critical for RAM)
+        if (msg.timestamp < BOOT_TIMESTAMP) return;
 
-        // Clean memory before processing heavy messages
-        if (global.gc) global.gc();
+        if (!N8N_WEBHOOK) return;
+        if (global.gc) global.gc(); // Clean RAM
 
         const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         
         // Human Behavior
         try {
             const chat = await msg.getChat();
+            await chat.clearState();
+            await new Promise(resolve => setTimeout(resolve, 500));
             await chat.sendSeen();
+            await new Promise(resolve => setTimeout(resolve, 300));
             await chat.sendStateTyping(); 
         } catch (e) {}
 
         let attachment = null;
 
-        // 1. Download Media (Memory Intensive!)
         if (msg.hasMedia) {
             try {
                 const media = await msg.downloadMedia();
@@ -112,14 +117,12 @@ mongoose.connect(MONGO_URI).then(() => {
                         filename: media.filename || "unknown_file"
                     };
                 }
-                // Help GC clear large media buffer
                 media = null;
-            } catch (err) { console.error("Media Err:", err.message); }
+            } catch (err) { console.error("Media Error:", err.message); }
         }
 
-        console.log(`📩 From ${cleanFrom} | Media: ${msg.hasMedia ? "YES" : "NO"}`);
+        console.log(`📩 New Message from ${cleanFrom}`);
         
-        // 2. Send to N8N
         try {
             await axios.post(N8N_WEBHOOK, {
                 from: msg.from,
@@ -128,11 +131,8 @@ mongoose.connect(MONGO_URI).then(() => {
                 timestamp: msg.timestamp,
                 attachment: attachment
             });
-            // Clear attachment from memory immediately
             attachment = null;
         } catch(e) { console.error("Webhook Error:", e.message); }
-        
-        checkMemoryHealth();
     });
 
     client.initialize();
@@ -143,18 +143,19 @@ app.get('/connect', async (req, res) => {
     if(req.query.password !== QR_PASSWORD) return res.status(403).send("⛔");
     if(currentQR === "connected") return res.send("✅ Connected");
     if(!currentQR) return res.send("⏳ Booting...");
-    const qrImage = await QRCode.toDataURL(currentQR);
-    res.send(`<img src="${qrImage}" />`);
+    
+    try {
+        const qrImage = await QRCode.toDataURL(currentQR);
+        res.send(`<div style="display:flex;justify-content:center;align-items:center;height:100vh;"><img src="${qrImage}" style="width:300px;height:300px;border:5px solid black;"/></div>`);
+    } catch (e) { res.status(500).send("Error generating QR"); }
 });
 
 app.post('/send', async (req, res) => {
     if(req.headers['authorization'] !== `Bearer ${QR_PASSWORD}`) return res.status(401).json({error: "Unauthorized"});
     let { number, message, attachment } = req.body;
-    
-    // Clear heavy request body asap
     req.body = null; 
-    
-    if (!number) return res.status(400).json({error: "No number"});
+
+    if (!number) return res.status(400).json({error: "No number provided"});
 
     const chatId = number.includes('@') ? number : number.replace('+', '') + "@c.us";
     
@@ -162,19 +163,24 @@ app.post('/send', async (req, res) => {
         if (attachment && attachment.data) {
             let media = new MessageMedia(attachment.mimetype, attachment.data, attachment.filename);
             await client.sendMessage(chatId, media, { caption: message || "" });
-            media = null; // Clear memory
+            media = null;
         } else {
             await client.sendMessage(chatId, message);
         }
+        
+        try {
+            const chat = await client.getChatById(chatId);
+            await chat.clearState(); 
+        } catch (e) {}
+
         res.json({status: "sent"});
     } catch(e) {
         if (e.message && e.message.includes('markedUnread')) {
             console.log("⚠️ Bug ignored");
-            return res.json({status: "sent", note: "Patched"});
+            return res.json({status: "sent", note: "Patched Error"});
         }
         res.status(500).json({error: e.toString()});
     } finally {
-        checkMemoryHealth();
         if (global.gc) global.gc();
     }
 });
