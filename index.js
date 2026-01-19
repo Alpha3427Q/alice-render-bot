@@ -35,17 +35,14 @@ mongoose.connect(MONGO_URI).then(() => {
     const store = new MongoStore({ mongoose: mongoose });
 
     client = new Client({
-        // 🔐 Session Management
+        // 👇 CHANGE 1: FORCE NEW SESSION (Fixes "Zombie Data" Crash)
         authStrategy: new RemoteAuth({ 
-            clientId: 'Client_V3', 
+            clientId: 'Client_V2', 
             store: store, 
             backupSyncIntervalMs: 300000 
         }),
         
-        // 🕵️ User Agent Spoofing
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36',
-
-        // 🛡️ Stability Settings
+        // 👇 CHANGE 2: "NUCLEAR" STABILITY SETTINGS
         puppeteer: {
             executablePath: '/usr/bin/google-chrome-stable',
             headless: true,
@@ -58,12 +55,11 @@ mongoose.connect(MONGO_URI).then(() => {
                 '--no-zygote',
                 '--single-process',
                 '--disable-gpu',
-                '--disable-extensions',
-                '--disable-software-rasterizer',
-                '--mute-audio',
-                '--disable-gl-drawing-for-tests',
-                '--window-size=1280,1024',
-                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
+                '--disable-extensions',      // NEW
+                '--disable-software-rasterizer', // NEW
+                '--mute-audio',              // NEW
+                '--disable-gl-drawing-for-tests', // NEW
+                '--window-size=1280,1024'    // NEW
             ],
             timeout: 60000
         }
@@ -72,31 +68,10 @@ mongoose.connect(MONGO_URI).then(() => {
     client.on('qr', (qr) => { currentQR = qr; });
     client.on('ready', () => { console.log('🚀 WhatsApp Ready!'); currentQR = "connected"; });
 
-    // --- INBOUND MESSAGE HANDLING ---
     client.on('message', async (msg) => {
         if (!N8N_WEBHOOK) return;
-
-        const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         
-        // 👇👇👇 IMPROVED HUMAN BEHAVIOR LOGIC 👇👇👇
-        try {
-            const chat = await msg.getChat();
-            
-            // 1. Force clear any previous state to ensure the new command registers
-            await chat.clearState(); 
-            
-            // 2. Mark the specific message as seen (Blue Tick)
-            // Using 'sendSeen' on the chat object marks the *entire* chat up to this point.
-            await chat.sendSeen();
-            
-            // 3. Start typing (Simulating human reading/replying)
-            await chat.sendStateTyping(); 
-            
-        } catch (e) {
-            console.error("⚠️ Status Error:", e.message);
-        }
-        // 👆👆👆 END IMPROVEMENT 👆👆👆
-
+        const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         let attachment = null;
 
         if (msg.hasMedia) {
@@ -123,7 +98,6 @@ mongoose.connect(MONGO_URI).then(() => {
                 attachment: attachment
             });
         } catch(e) { console.error("Webhook Error:", e.message); }
-        
         checkMemoryHealth();
     });
 
@@ -153,14 +127,6 @@ app.post('/send', async (req, res) => {
         } else {
             await client.sendMessage(chatId, message);
         }
-        
-        // 👇 Stop "Typing..." once we send the reply
-        // This is important so the NEXT message can start the cycle cleanly.
-        try {
-            const chat = await client.getChatById(chatId);
-            await chat.clearState(); 
-        } catch (e) {}
-
         res.json({status: "sent"});
     } catch(e) {
         if (e.message && e.message.includes('markedUnread')) {
