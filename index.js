@@ -15,8 +15,8 @@ const MONGO_URI = process.env.MONGO_URI;
 const QR_PASSWORD = process.env.QR_PASSWORD || "agartha_secret";
 const N8N_WEBHOOK = process.env.N8N_WEBHOOK;
 
-// TIMESTAMP: Ignore old messages to save RAM
-const BOOT_TIMESTAMP = Math.floor(Date.now() / 1000);
+// 🛡️ CRASH PROTECTION: Prevents the bot from dying during the "History Flood"
+let isSystemReady = false; 
 
 let client;
 let currentQR = null;
@@ -30,9 +30,9 @@ mongoose.connect(MONGO_URI).then(() => {
 
     client = new Client({
         authStrategy: new RemoteAuth({ 
-            clientId: 'Alice_ForceSave_V1', // New ID
+            clientId: 'Alice_Typing_Only', // New ID for a fresh, clean start
             store: store, 
-            backupSyncIntervalMs: 60000 // Set to 60s to fix the "Invalid Value" error
+            backupSyncIntervalMs: 60000 // Save session every 60s
         }),
         
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36',
@@ -53,7 +53,6 @@ mongoose.connect(MONGO_URI).then(() => {
                 '--disable-software-rasterizer',
                 '--mute-audio',
                 '--disable-features=site-per-process', 
-                '--renderer-process-limit=1', 
                 '--window-size=800,600',
                 '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
             ],
@@ -67,42 +66,35 @@ mongoose.connect(MONGO_URI).then(() => {
     });
 
     client.on('remote_session_saved', () => {
-        console.log("💾 SUCCESS: Session saved to MongoDB!");
+        console.log("💾 Session successfully saved to MongoDB!");
     });
     
-    client.on('ready', async () => { 
-        console.log('🚀 WhatsApp Ready!'); 
+    client.on('ready', () => { 
+        console.log('🚀 WhatsApp Ready! Starting Cool-down...'); 
         currentQR = "connected"; 
         
-        // 👇👇👇 THE TRICK: FORCE SAVE IMMEDIATELY 👇👇👇
-        console.log("⚡ Forcing Emergency Save...");
-        try {
-            // We manually trigger the save function, bypassing the 60s timer
-            await client.authStrategy.saveSession(); 
-            console.log("✅ Emergency Save Complete! You are safe from crashes.");
-        } catch (e) {
-            console.error("⚠️ Manual Save Failed:", e.message);
-        }
+        // 👇 CRITICAL: Wait 30s before processing messages to prevent crash
+        setTimeout(() => {
+            isSystemReady = true;
+            console.log("✅ Cool-down complete. Bot is active.");
+        }, 30000); 
     });
 
     // --- INBOUND MESSAGE HANDLING ---
     client.on('message', async (msg) => {
-        // Ignore history (Critical for RAM)
-        if (msg.timestamp < BOOT_TIMESTAMP) return;
+        // ⛔ Ignore messages during startup to save RAM
+        if (!isSystemReady) return;
 
         if (!N8N_WEBHOOK) return;
         if (global.gc) global.gc();
 
         const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         
-        // Human Behavior (Blue Ticks)
+        // --- TYPING STATUS ONLY (No Blue Tick) ---
         try {
             const chat = await msg.getChat();
-            await chat.clearState();
-            await new Promise(resolve => setTimeout(resolve, 500));
-            await chat.sendSeen();
-            await new Promise(resolve => setTimeout(resolve, 300));
-            await chat.sendStateTyping(); 
+            await chat.clearState(); // Clear previous status
+            await chat.sendStateTyping(); // Start Typing...
         } catch (e) {}
 
         let attachment = null;
@@ -168,6 +160,7 @@ app.post('/send', async (req, res) => {
             await client.sendMessage(chatId, message);
         }
         
+        // Stop "Typing..." after sending
         try {
             const chat = await client.getChatById(chatId);
             await chat.clearState(); 
