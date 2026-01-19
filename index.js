@@ -18,7 +18,6 @@ const N8N_WEBHOOK = process.env.N8N_WEBHOOK;
 // --- MEMORY HEALTH ---
 function checkMemoryHealth() {
     const used = process.memoryUsage().rss / 1024 / 1024;
-    // console.log(`🧠 RAM: ${Math.round(used)} MB`);
     if (used > 470) {
         console.warn("⚠️ Memory Critical. Restarting...");
         process.exit(1);
@@ -36,17 +35,14 @@ mongoose.connect(MONGO_URI).then(() => {
     const store = new MongoStore({ mongoose: mongoose });
 
     client = new Client({
-        // 🔐 Session Management
+        // 👇 CHANGE 1: FORCE NEW SESSION (Fixes "Zombie Data" Crash)
         authStrategy: new RemoteAuth({ 
-            clientId: 'Client_V3', 
+            clientId: 'Client_V2', 
             store: store, 
             backupSyncIntervalMs: 300000 
         }),
         
-        // 🕵️ User Agent Spoofing (Tricks WhatsApp into thinking this is a real PC)
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36',
-
-        // 🛡️ "Nuclear" Stability Settings for Render/Docker
+        // 👇 CHANGE 2: "NUCLEAR" STABILITY SETTINGS
         puppeteer: {
             executablePath: '/usr/bin/google-chrome-stable',
             headless: true,
@@ -59,13 +55,11 @@ mongoose.connect(MONGO_URI).then(() => {
                 '--no-zygote',
                 '--single-process',
                 '--disable-gpu',
-                '--disable-extensions',
-                '--disable-software-rasterizer',
-                '--mute-audio',
-                '--disable-gl-drawing-for-tests',
-                '--window-size=1280,1024',
-                // Must match the userAgent above
-                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
+                '--disable-extensions',      // NEW
+                '--disable-software-rasterizer', // NEW
+                '--mute-audio',              // NEW
+                '--disable-gl-drawing-for-tests', // NEW
+                '--window-size=1280,1024'    // NEW
             ],
             timeout: 60000
         }
@@ -74,26 +68,12 @@ mongoose.connect(MONGO_URI).then(() => {
     client.on('qr', (qr) => { currentQR = qr; });
     client.on('ready', () => { console.log('🚀 WhatsApp Ready!'); currentQR = "connected"; });
 
-    // --- INBOUND MESSAGE HANDLING ---
     client.on('message', async (msg) => {
         if (!N8N_WEBHOOK) return;
-
-        const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         
-        // 👇👇👇 HUMAN BEHAVIOR BLOCK 👇👇👇
-        // Safe to use now because 'patch-loader.js' fixed the crash!
-        try {
-            const chat = await msg.getChat();
-            await chat.sendSeen();        // Sends Blue Tick
-            await chat.sendStateTyping(); // Shows "Typing..." status
-        } catch (e) {
-            // Just ignore if we can't send seen/typing (don't let it stop the bot)
-        }
-        // 👆👆👆 END HUMAN BEHAVIOR 👆👆👆
-
+        const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         let attachment = null;
 
-        // 1. Download Media if present
         if (msg.hasMedia) {
             try {
                 const media = await msg.downloadMedia();
@@ -109,7 +89,6 @@ mongoose.connect(MONGO_URI).then(() => {
 
         console.log(`📩 From ${cleanFrom} | Media: ${msg.hasMedia ? "YES" : "NO"}`);
         
-        // 2. Send to N8N AI Brain
         try {
             await axios.post(N8N_WEBHOOK, {
                 from: msg.from,
@@ -119,7 +98,6 @@ mongoose.connect(MONGO_URI).then(() => {
                 attachment: attachment
             });
         } catch(e) { console.error("Webhook Error:", e.message); }
-        
         checkMemoryHealth();
     });
 
@@ -151,7 +129,6 @@ app.post('/send', async (req, res) => {
         }
         res.json({status: "sent"});
     } catch(e) {
-        // Our patch handles the real error, but we log this just in case
         if (e.message && e.message.includes('markedUnread')) {
             console.log("⚠️ Bug ignored (markedUnread), message likely sent.");
             return res.json({status: "sent", note: "Patched Error"});
