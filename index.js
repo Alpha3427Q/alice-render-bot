@@ -35,14 +35,16 @@ mongoose.connect(MONGO_URI).then(() => {
     const store = new MongoStore({ mongoose: mongoose });
 
     client = new Client({
-        // 👇 CHANGE 1: FORCE NEW SESSION (Fixes "Zombie Data" Crash)
+        // 👇 Force a new session to ensure clean slate
         authStrategy: new RemoteAuth({ 
-            clientId: 'Client_V2', 
+            clientId: 'Client_V3', // Changed to V3 to force fresh login attempt
             store: store, 
             backupSyncIntervalMs: 300000 
         }),
         
-        // 👇 CHANGE 2: "NUCLEAR" STABILITY SETTINGS
+        // 👇 SPOOFING: Pretend to be a real Windows PC
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36',
+
         puppeteer: {
             executablePath: '/usr/bin/google-chrome-stable',
             headless: true,
@@ -55,11 +57,8 @@ mongoose.connect(MONGO_URI).then(() => {
                 '--no-zygote',
                 '--single-process',
                 '--disable-gpu',
-                '--disable-extensions',      // NEW
-                '--disable-software-rasterizer', // NEW
-                '--mute-audio',              // NEW
-                '--disable-gl-drawing-for-tests', // NEW
-                '--window-size=1280,1024'    // NEW
+                // 👇 MATCHING USER AGENT IN BROWSER ARGS
+                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
             ],
             timeout: 60000
         }
