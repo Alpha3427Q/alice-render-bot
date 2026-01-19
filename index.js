@@ -6,7 +6,7 @@ const QRCode = require('qrcode');
 const axios = require('axios');
 const app = express();
 
-// --- 1. CONFIGURATION ---
+// --- CONFIGURATION ---
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
@@ -15,7 +15,7 @@ const MONGO_URI = process.env.MONGO_URI;
 const QR_PASSWORD = process.env.QR_PASSWORD || "agartha_secret";
 const N8N_WEBHOOK = process.env.N8N_WEBHOOK;
 
-// --- 2. MEMORY HEALTH MONITOR ---
+// --- MEMORY HEALTH ---
 function checkMemoryHealth() {
     const used = process.memoryUsage().rss / 1024 / 1024;
     if (used > 470) {
@@ -24,31 +24,29 @@ function checkMemoryHealth() {
     }
 }
 
-// --- 3. GLOBAL VARIABLES ---
 let client;
 let currentQR = null;
-const SYSTEM_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36';
 
-app.get('/', (req, res) => res.send("<html><body><h1>🟢 Alice is Online</h1></body></html>"));
+app.get('/', (req, res) => res.send("<html><body><h1>🟢 System Online</h1></body></html>"));
 
-// --- 4. DATABASE & CLIENT ---
+// --- DATABASE & CLIENT ---
 mongoose.connect(MONGO_URI).then(() => {
     console.log('✅ Connected to MongoDB');
     const store = new MongoStore({ mongoose: mongoose });
 
     client = new Client({
-        // 👇👇👇 PERSISTENCE FIX 👇👇👇
+        // 🔐 Session Management
         authStrategy: new RemoteAuth({ 
-            // 1. STABLE ID: We stop changing this name now. 'Alice_Main' is permanent.
-            clientId: 'Alice_Main', 
+            clientId: 'Alice_Fixed', // New ID to ensure a clean start
             store: store, 
-            // 2. FAST SAVE: Save session every 60 seconds (instead of 5 mins)
+            // 👇 FIX FOR QR LOOP: Save every 60s (1 min) instead of 5 mins
             backupSyncIntervalMs: 60000 
         }),
-        // 👆👆👆 END FIX 👆👆👆
+        
+        // 🕵️ User Agent Spoofing (Your preferred setting)
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36',
 
-        userAgent: SYSTEM_USER_AGENT,
-
+        // 🛡️ Stability Settings (Your preferred setting)
         puppeteer: {
             executablePath: '/usr/bin/google-chrome-stable',
             headless: true,
@@ -66,51 +64,53 @@ mongoose.connect(MONGO_URI).then(() => {
                 '--mute-audio',
                 '--disable-gl-drawing-for-tests',
                 '--window-size=1280,1024',
-                `--user-agent=${SYSTEM_USER_AGENT}`
+                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
             ],
             timeout: 60000
         }
     });
 
-    // --- NEW: LOGIN DEBUGGING ---
-    // This tells us if MongoDB is actually working
-    client.on('authenticated', () => {
-        console.log("🔑 AUTH SUCCESS: Session restored from MongoDB!");
-    });
-
-    client.on('auth_failure', (msg) => {
-        console.error("⛔ AUTH FAILED: ", msg);
-    });
-
-    client.on('qr', (qr) => { 
-        console.log("📌 QR Code Received (Scan required)");
-        currentQR = qr; 
-    });
+    client.on('qr', (qr) => { currentQR = qr; });
     
-    client.on('ready', () => { 
-        console.log('🚀 WhatsApp Ready & Connected!'); 
-        currentQR = "connected"; 
+    // Log when session is saved so you know it's working
+    client.on('remote_session_saved', () => {
+        console.log("💾 Session Saved!");
     });
 
-    // --- INBOUND MESSAGES ---
+    client.on('ready', () => { console.log('🚀 WhatsApp Ready!'); currentQR = "connected"; });
+
+    // --- INBOUND MESSAGE HANDLING ---
     client.on('message', async (msg) => {
         if (!N8N_WEBHOOK) return;
 
         const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         
-        // Human Behavior (Blue Ticks + Typing)
+        // 👇👇👇 BLUE TICK FIX IS HERE 👇👇👇
         try {
             const chat = await msg.getChat();
+            
+            // 1. Clear previous state
             await chat.clearState();
+            
+            // 2. WAIT 500ms (Crucial Fix: Prevents WhatsApp ignoring the command)
             await new Promise(resolve => setTimeout(resolve, 500));
+            
+            // 3. Send Blue Tick
             await chat.sendSeen();
+            
+            // 4. WAIT 300ms (Crucial Fix: Human-like pause)
             await new Promise(resolve => setTimeout(resolve, 300));
+            
+            // 5. Start typing
             await chat.sendStateTyping(); 
+            
         } catch (e) {
             console.error("⚠️ Status Error:", e.message);
         }
+        // 👆👆👆 END FIX 👆👆👆
 
         let attachment = null;
+
         if (msg.hasMedia) {
             try {
                 const media = await msg.downloadMedia();
@@ -125,7 +125,7 @@ mongoose.connect(MONGO_URI).then(() => {
         }
 
         console.log(`📩 From ${cleanFrom} | Media: ${msg.hasMedia ? "YES" : "NO"}`);
-
+        
         try {
             await axios.post(N8N_WEBHOOK, {
                 from: msg.from,
@@ -135,7 +135,7 @@ mongoose.connect(MONGO_URI).then(() => {
                 attachment: attachment
             });
         } catch(e) { console.error("Webhook Error:", e.message); }
-
+        
         checkMemoryHealth();
     });
 
@@ -147,18 +147,12 @@ app.get('/connect', async (req, res) => {
     if(req.query.password !== QR_PASSWORD) return res.status(403).send("⛔");
     if(currentQR === "connected") return res.send("✅ Connected");
     if(!currentQR) return res.send("⏳ Booting...");
-    
-    try {
-        const qrImage = await QRCode.toDataURL(currentQR);
-        res.send(`<div style="display:flex;justify-content:center;align-items:center;height:100vh;"><img src="${qrImage}" style="width:300px;height:300px;border:5px solid black;"/></div>`);
-    } catch (e) {
-        res.status(500).send("Error generating QR");
-    }
+    const qrImage = await QRCode.toDataURL(currentQR);
+    res.send(`<img src="${qrImage}" />`);
 });
 
 app.post('/send', async (req, res) => {
     if(req.headers['authorization'] !== `Bearer ${QR_PASSWORD}`) return res.status(401).json({error: "Unauthorized"});
-
     let { number, message, attachment } = req.body;
     if (!number) return res.status(400).json({error: "No number provided"});
 
@@ -167,11 +161,12 @@ app.post('/send', async (req, res) => {
     try {
         if (attachment && attachment.data) {
             let media = new MessageMedia(attachment.mimetype, attachment.data, attachment.filename);
-            await client.sendMessage(chatId, media, { caption: message || "", sendAudioAsVoice: attachment.mimetype.startsWith('audio') });
+            await client.sendMessage(chatId, media, { caption: message || "" });
         } else {
             await client.sendMessage(chatId, message);
         }
         
+        // Stop "Typing..." immediately after sending
         try {
             const chat = await client.getChatById(chatId);
             await chat.clearState(); 
@@ -180,7 +175,7 @@ app.post('/send', async (req, res) => {
         res.json({status: "sent"});
     } catch(e) {
         if (e.message && e.message.includes('markedUnread')) {
-            console.log("⚠️ Library Bug Ignored");
+            console.log("⚠️ Bug ignored (markedUnread), message likely sent.");
             return res.json({status: "sent", note: "Patched Error"});
         }
         res.status(500).json({error: e.toString()});
