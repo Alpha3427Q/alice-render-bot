@@ -35,11 +35,16 @@ mongoose.connect(MONGO_URI).then(() => {
     const store = new MongoStore({ mongoose: mongoose });
 
     client = new Client({
-        authStrategy: new RemoteAuth({ store: store, backupSyncIntervalMs: 300000 }),
+        // 👇 CHANGE 1: FORCE NEW SESSION (Fixes "Zombie Data" Crash)
+        authStrategy: new RemoteAuth({ 
+            clientId: 'Client_V2', 
+            store: store, 
+            backupSyncIntervalMs: 300000 
+        }),
         
-        // 👇👇👇 THIS IS THE CRITICAL FIX FOR THE CRASH 👇👇👇
+        // 👇 CHANGE 2: "NUCLEAR" STABILITY SETTINGS
         puppeteer: {
-            executablePath: '/usr/bin/google-chrome-stable', 
+            executablePath: '/usr/bin/google-chrome-stable',
             headless: true,
             args: [
                 '--no-sandbox',
@@ -49,11 +54,15 @@ mongoose.connect(MONGO_URI).then(() => {
                 '--no-first-run',
                 '--no-zygote',
                 '--single-process',
-                '--disable-gpu'
+                '--disable-gpu',
+                '--disable-extensions',      // NEW
+                '--disable-software-rasterizer', // NEW
+                '--mute-audio',              // NEW
+                '--disable-gl-drawing-for-tests', // NEW
+                '--window-size=1280,1024'    // NEW
             ],
             timeout: 60000
         }
-        // 👆👆👆 END FIX 👆👆👆
     });
 
     client.on('qr', (qr) => { currentQR = qr; });
@@ -120,7 +129,6 @@ app.post('/send', async (req, res) => {
         }
         res.json({status: "sent"});
     } catch(e) {
-        // Our 'patch-loader.js' handles the bug, this is just a fallback log
         if (e.message && e.message.includes('markedUnread')) {
             console.log("⚠️ Bug ignored (markedUnread), message likely sent.");
             return res.json({status: "sent", note: "Patched Error"});
