@@ -15,7 +15,7 @@ const MONGO_URI = process.env.MONGO_URI;
 const QR_PASSWORD = process.env.QR_PASSWORD || "agartha_secret";
 const N8N_WEBHOOK = process.env.N8N_WEBHOOK;
 
-// TIMESTAMP: Ignore messages from before the bot started (Saves RAM)
+// TIMESTAMP: Ignore old messages to save RAM
 const BOOT_TIMESTAMP = Math.floor(Date.now() / 1000);
 
 let client;
@@ -29,16 +29,12 @@ mongoose.connect(MONGO_URI).then(() => {
     const store = new MongoStore({ mongoose: mongoose });
 
     client = new Client({
-        // 👇👇👇 EMERGENCY SAVE SETTINGS 👇👇👇
         authStrategy: new RemoteAuth({ 
-            clientId: 'Alice_Final_Persistent', // New ID
+            clientId: 'Alice_ForceSave_V1', // New ID
             store: store, 
-            // ⚠️ EXTREME SETTING: Try to save every 10 seconds.
-            // This ensures we catch the session data before the crash happens.
-            backupSyncIntervalMs: 10000 
+            backupSyncIntervalMs: 60000 // Set to 60s to fix the "Invalid Value" error
         }),
-        // 👆👆👆 END FIX 👆👆👆
-
+        
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36',
 
         puppeteer: {
@@ -51,12 +47,11 @@ mongoose.connect(MONGO_URI).then(() => {
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
                 '--no-zygote',
-                '--single-process', 
+                '--single-process',
                 '--disable-gpu',
                 '--disable-extensions',
                 '--disable-software-rasterizer',
                 '--mute-audio',
-                // RAM Optimizations
                 '--disable-features=site-per-process', 
                 '--renderer-process-limit=1', 
                 '--window-size=800,600',
@@ -66,36 +61,41 @@ mongoose.connect(MONGO_URI).then(() => {
         }
     });
 
-    // Debug Logs for Saving
-    client.on('remote_session_saved', () => {
-        console.log("💾 SUCCESS: Session saved to MongoDB! (You are safe now)");
-    });
-
     client.on('qr', (qr) => { 
         console.log("📌 QR Code Received");
         currentQR = qr; 
+    });
+
+    client.on('remote_session_saved', () => {
+        console.log("💾 SUCCESS: Session saved to MongoDB!");
     });
     
     client.on('ready', async () => { 
         console.log('🚀 WhatsApp Ready!'); 
         currentQR = "connected"; 
         
-        // 👇 MANUALLY FORCE STORAGE UPDATE IF POSSIBLE
-        // (We rely on the 10s timer, but this log confirms we reached this state)
-        console.log("⏳ Attempting to survive long enough to save...");
+        // 👇👇👇 THE TRICK: FORCE SAVE IMMEDIATELY 👇👇👇
+        console.log("⚡ Forcing Emergency Save...");
+        try {
+            // We manually trigger the save function, bypassing the 60s timer
+            await client.authStrategy.saveSession(); 
+            console.log("✅ Emergency Save Complete! You are safe from crashes.");
+        } catch (e) {
+            console.error("⚠️ Manual Save Failed:", e.message);
+        }
     });
 
     // --- INBOUND MESSAGE HANDLING ---
     client.on('message', async (msg) => {
-        // 1. Ignore History (Critical for RAM)
+        // Ignore history (Critical for RAM)
         if (msg.timestamp < BOOT_TIMESTAMP) return;
 
         if (!N8N_WEBHOOK) return;
-        if (global.gc) global.gc(); // Clean RAM
+        if (global.gc) global.gc();
 
         const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         
-        // Human Behavior
+        // Human Behavior (Blue Ticks)
         try {
             const chat = await msg.getChat();
             await chat.clearState();
