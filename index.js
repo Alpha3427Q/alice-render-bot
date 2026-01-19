@@ -27,7 +27,7 @@ function checkMemoryHealth() {
 let client;
 let currentQR = null;
 
-app.get('/', (req, res) => res.send("<html><body><h1>🟢 System Online</h1></body></html>"));
+app.get('/', (req, res) => res.send("<html><body><h1>System Maintenance</h1></body></html>"));
 
 // --- DATABASE & CLIENT ---
 mongoose.connect(MONGO_URI).then(() => {
@@ -35,17 +35,17 @@ mongoose.connect(MONGO_URI).then(() => {
     const store = new MongoStore({ mongoose: mongoose });
 
     client = new Client({
-        // 👇 SESSION FIX: "Login Once" Settings 👇
+        // 🔐 Session Management
         authStrategy: new RemoteAuth({ 
-            clientId: 'Alice_Permanent', // Static name so it always finds your session
+            clientId: 'Client_V3', 
             store: store, 
-            backupSyncIntervalMs: 60000 // Save every 60s (Fixes the loop!)
+            backupSyncIntervalMs: 300000 
         }),
         
-        // 🕵️ User Agent Spoofing (Your preferred setting)
+        // 🕵️ User Agent Spoofing
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36',
 
-        // 🛡️ Stability Settings (Your preferred setting)
+        // 🛡️ Stability Settings
         puppeteer: {
             executablePath: '/usr/bin/google-chrome-stable',
             headless: true,
@@ -69,16 +69,7 @@ mongoose.connect(MONGO_URI).then(() => {
         }
     });
 
-    client.on('qr', (qr) => { 
-        console.log("📌 QR Code Received (Scan needed)");
-        currentQR = qr; 
-    });
-    
-    // Log when session is saved so you know it worked
-    client.on('remote_session_saved', () => {
-        console.log("💾 Login Saved to Database!");
-    });
-
+    client.on('qr', (qr) => { currentQR = qr; });
     client.on('ready', () => { console.log('🚀 WhatsApp Ready!'); currentQR = "connected"; });
 
     // --- INBOUND MESSAGE HANDLING ---
@@ -87,19 +78,24 @@ mongoose.connect(MONGO_URI).then(() => {
 
         const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         
-        // 👇 BLUE TICK FIX (With Delays) 👇
+        // 👇👇👇 IMPROVED HUMAN BEHAVIOR LOGIC 👇👇👇
         try {
             const chat = await msg.getChat();
             
-            await chat.clearState();
-            await new Promise(resolve => setTimeout(resolve, 500)); // Delay 1
+            // 1. Force clear any previous state to ensure the new command registers
+            await chat.clearState(); 
+            
+            // 2. Mark the specific message as seen (Blue Tick)
+            // Using 'sendSeen' on the chat object marks the *entire* chat up to this point.
             await chat.sendSeen();
-            await new Promise(resolve => setTimeout(resolve, 300)); // Delay 2
+            
+            // 3. Start typing (Simulating human reading/replying)
             await chat.sendStateTyping(); 
             
         } catch (e) {
             console.error("⚠️ Status Error:", e.message);
         }
+        // 👆👆👆 END IMPROVEMENT 👆👆👆
 
         let attachment = null;
 
@@ -158,7 +154,8 @@ app.post('/send', async (req, res) => {
             await client.sendMessage(chatId, message);
         }
         
-        // Stop "Typing..." immediately after sending
+        // 👇 Stop "Typing..." once we send the reply
+        // This is important so the NEXT message can start the cycle cleanly.
         try {
             const chat = await client.getChatById(chatId);
             await chat.clearState(); 
