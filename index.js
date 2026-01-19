@@ -38,14 +38,9 @@ mongoose.connect(MONGO_URI).then(() => {
     client = new Client({
         authStrategy: new RemoteAuth({ store: store, backupSyncIntervalMs: 300000 }),
         
-        // 👇👇👇 FIX START: FORCE OLD VERSION TO PREVENT 'markedUnread' ERROR 👇👇👇
-        webVersionCache: {
-            type: 'remote',
-            remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1031490220-alpha.html',
-        },
-        // 👆👆👆 FIX END 👆👆👆
-
-        // 🛠️ PUPPETEER CONFIG (Keep these! They prevent startup timeouts)
+        // ⚠️ REMOVED 'webVersionCache' HERE TO PREVENT CRASH ⚠️
+        
+        // 🛠️ PUPPETEER CONFIG (Restored from your original code)
         puppeteer: {
             headless: true,
             args: [
@@ -73,6 +68,7 @@ mongoose.connect(MONGO_URI).then(() => {
         const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         let attachment = null;
 
+        // ✅ Restored Media Handling
         if (msg.hasMedia) {
             try {
                 const media = await msg.downloadMedia();
@@ -125,6 +121,7 @@ app.post('/send', async (req, res) => {
     try {
         const chatId = number.includes('@') ? number : number.replace('+', '') + "@c.us";
 
+        // ✅ Restored Media Sending Logic
         if (attachment && attachment.data) {
             console.log(`📤 Sending Media...`);
             let media = new MessageMedia(attachment.mimetype, attachment.data, attachment.filename);
@@ -147,8 +144,7 @@ app.post('/send', async (req, res) => {
     } catch(e) {
         const errorMsg = e.toString();
         
-        // I kept your original fallback here just in case, 
-        // but the webVersionCache fix above should prevent this error from ever happening.
+        // This catch block is a backup, but the 'patch-loader.js' handles the real fix internally.
         if (errorMsg.includes('markedUnread')) {
             console.warn("⚠️ Known Library Bug (#5718) detected. Ignoring... (Message Sent)");
             return res.json({status: "sent", note: "Handled internal bug"});
