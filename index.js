@@ -67,7 +67,7 @@ mongoose.connect(MONGO_URI).then(async () => {
 
     // --- INBOUND MESSAGES ---
     client.on('message', async (msg) => {
-        // 1. IGNORE STATUS UPDATES (Safety First)
+        // 1. IGNORE STATUS UPDATES
         if (msg.from === 'status@broadcast' || msg.isStatus) return;
 
         // 2. IGNORE HISTORY
@@ -76,36 +76,43 @@ mongoose.connect(MONGO_URI).then(async () => {
         if (!N8N_WEBHOOK) return;
         if (global.gc) global.gc();
 
-        // 3. 🔍 ID RESOLVER (THE FIX)
-        // We fetch the contact info to get the REAL phone number, ignoring @lid
+        // 3. 🔍 ID & NAME RESOLVER (UPDATED)
         let realNumberId = msg.from;
-        let contactName = msg._data.notifyName || "Unknown";
+        // Default to the name in the message packet
+        let displayName = msg._data.notifyName || "Unknown"; 
+        let publicPushname = msg._data.notifyName || "Unknown";
         
         try {
             const contact = await msg.getContact();
-            if (contact && contact.number) {
-                // This converts "12345@lid" -> "919999999999@c.us"
-                realNumberId = contact.number + "@c.us";
-                contactName = contact.name || contact.pushname || contactName;
+            if (contact) {
+                // A. ID FIX: Get real number from contact profile
+                if (contact.number) {
+                    realNumberId = contact.number + "@c.us";
+                }
+
+                // B. NAME FIX: 
+                // 'contact.pushname' = The name THEY set (e.g. "Gamer123")
+                // 'contact.name' = The name YOU saved (e.g. "Rahul Work")
+                
+                if (contact.pushname) {
+                    publicPushname = contact.pushname;
+                }
+
+                // Logic: If you saved a name, use it. Otherwise use their public name.
+                displayName = contact.name || contact.pushname || displayName;
             }
         } catch (e) {
-            console.log("⚠️ Contact lookup failed, using original ID");
+            console.log("⚠️ Contact lookup failed, using defaults");
         }
 
-        console.log(`📩 Resolved ID: ${realNumberId} (was ${msg.from})`);
+        console.log(`📩 Resolved: ${displayName} (${realNumberId})`);
 
-        // 4. BLUE TICK + TYPING (The Human Touch)
+        // 4. HUMAN BEHAVIOR (Blue Tick + Typing)
         try {
             const chat = await msg.getChat();
-            await chat.clearState(); // Clear any stuck status
-            
-            // Send Blue Tick
+            await chat.clearState();
             await chat.sendSeen().catch(() => {});
-            
-            // Wait a tiny bit (human reaction time)
             await new Promise(r => setTimeout(r, 300));
-            
-            // Start "Typing..." (This stays active while n8n thinks)
             await chat.sendStateTyping(); 
         } catch (e) {}
 
@@ -119,13 +126,17 @@ mongoose.connect(MONGO_URI).then(async () => {
             } catch (err) {}
         }
 
-        // 🚀 SEND TO N8N
+        // 🚀 SEND TO N8N (With NEW 'username' field)
         try {
             await axios.post(N8N_WEBHOOK, {
-                from: realNumberId,     // The real number
-                original_id: msg.from,  // Backup ID
+                from: realNumberId,      // Real Number (@c.us)
+                original_id: msg.from,   // Raw ID (Backup)
                 body: msg.body,
-                name: contactName,
+                
+                // 👇 THIS IS THE NEW PART 👇
+                name: displayName,       // Best Name (Prioritizes your phonebook)
+                username: publicPushname,// Public Name (What they call themselves)
+                
                 timestamp: msg.timestamp,
                 attachment: attachment
             });
@@ -146,16 +157,11 @@ app.post('/send', async (req, res) => {
     const chatId = number.includes('@') ? number : number.replace('+', '') + "@c.us";
 
     try {
-        // 👇👇👇 OUTBOUND TYPING SIMULATION (Added Feature) 👇👇👇
+        // 👇 OUTBOUND TYPING SIMULATION 👇
         const chat = await client.getChatById(chatId);
-        
-        // 1. Ensure "Typing..." is showing
         await chat.sendStateTyping();
-        
-        // 2. Simulate "Writing Time" (1 second fixed delay for realism)
-        // This prevents the bot from replying INSTANTLY which looks robotic
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        // 👆👆👆 END SIMULATION 👆👆👆
+        await new Promise(resolve => setTimeout(resolve, 1000)); // 1s typing delay
+        // 👆 END SIMULATION 👆
 
         if (attachment && attachment.data) {
             let media = new MessageMedia(attachment.mimetype, attachment.data, attachment.filename);
@@ -164,7 +170,6 @@ app.post('/send', async (req, res) => {
             await client.sendMessage(chatId, message);
         }
         
-        // 3. Stop Typing immediately after sending
         await chat.clearState(); 
 
         res.json({status: "sent"});
