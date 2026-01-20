@@ -30,20 +30,19 @@ app.get('/', (req, res) => res.send("<html><body><h1>🟢 Alice System Online</h
 mongoose.connect(MONGO_URI).then(async () => {
     console.log('✅ Connected to MongoDB');
 
-    // 👇 FIX: Check for the specific FILE BUCKET, not the generic session list
+    // PRE-CHECK: Look for the FILE BUCKET
     const db = mongoose.connection.db;
     const bucketCheck = await db.listCollections({ name: `whatsapp-RemoteAuth-${CLIENT_ID}.files` }).toArray();
 
     if (bucketCheck.length > 0) {
-        console.log(`🎉 FOUND EXISTING CREDENTIALS: "whatsapp-RemoteAuth-${CLIENT_ID}.files"`);
+        console.log(`🎉 FOUND CREDENTIALS: "whatsapp-RemoteAuth-${CLIENT_ID}.files"`);
         console.log("🚀 Auto-logging in...");
         isSessionFound = true;
     } else {
-        console.log(`⚠️ NO CREDENTIALS FOUND for "${CLIENT_ID}". You must scan the QR code.`);
+        console.log(`⚠️ NO CREDENTIALS FOUND. You must scan the QR code.`);
         isSessionFound = false;
     }
 
-    // 2. SETUP STORE & CLIENT
     const store = new MongoStore({ mongoose: mongoose });
 
     client = new Client({
@@ -78,15 +77,13 @@ mongoose.connect(MONGO_URI).then(async () => {
         }
     });
 
-    // --- EVENTS ---
-
     client.on('qr', (qr) => { 
-        console.log("📌 QR Code Generated (Session missing or invalid)");
+        console.log("📌 QR Code Generated");
         currentQR = qr; 
     });
 
     client.on('remote_session_saved', () => {
-        console.log("💾 Session Data Saved to MongoDB!");
+        console.log("💾 Session Data Saved!");
     });
     
     client.on('ready', () => { 
@@ -96,7 +93,7 @@ mongoose.connect(MONGO_URI).then(async () => {
 
     // --- INBOUND MESSAGE HANDLING ---
     client.on('message', async (msg) => {
-        // 1. Safety Filter
+        // 1. Safety Filter (Ignore History)
         if (msg.timestamp < BOOT_TIMESTAMP) return;
 
         if (!N8N_WEBHOOK) return;
@@ -104,18 +101,32 @@ mongoose.connect(MONGO_URI).then(async () => {
 
         const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         
-        // 2. BLUE TICKS & TYPING
+        // 👇👇👇 BLUE TICK FIX IS HERE 👇👇👇
         try {
             const chat = await msg.getChat();
+            
+            // 1. RESET: Clears "Typing" or "Recording" status from previous msg
+            await chat.clearState();
+            
+            // 2. WAIT: Give WhatsApp 0.5s to process the reset
             await new Promise(resolve => setTimeout(resolve, 500));
-            await chat.sendSeen(); 
+            
+            // 3. SEEN: Send Blue Tick
+            await chat.sendSeen();
+            
+            // 4. WAIT: Give it a moment to register
             await new Promise(resolve => setTimeout(resolve, 300));
+            
+            // 5. TYPING: Start typing animation
             await chat.sendStateTyping(); 
-        } catch (e) {}
+            
+        } catch (e) {
+            console.log("⚠️ Status Error (Ignored):", e.message);
+        }
+        // 👆👆👆 END FIX 👆👆👆
 
         let attachment = null;
 
-        // 3. MEDIA HANDLING
         if (msg.hasMedia) {
             try {
                 const media = await msg.downloadMedia();
@@ -131,7 +142,6 @@ mongoose.connect(MONGO_URI).then(async () => {
 
         console.log(`📩 New Message from ${cleanFrom}`);
         
-        // 4. SEND TO N8N
         try {
             await axios.post(N8N_WEBHOOK, {
                 from: msg.from,
@@ -187,6 +197,7 @@ app.post('/send', async (req, res) => {
             await client.sendMessage(chatId, message);
         }
         
+        // Stop typing immediately after sending
         try {
             const chat = await client.getChatById(chatId);
             await chat.clearState(); 
