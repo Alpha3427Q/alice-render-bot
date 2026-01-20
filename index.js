@@ -14,31 +14,29 @@ const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI;
 const N8N_WEBHOOK = process.env.N8N_WEBHOOK;
 const QR_PASSWORD = process.env.QR_PASSWORD || "agartha_secret";
-
-// 🔵 PERMANENT ID
 const CLIENT_ID = "Alice_Fresh_V1";
-// 🕒 TIMESTAMP (Safety Filter)
+// 🕒 TIMESTAMP: Safety filter for old messages
 const BOOT_TIMESTAMP = Math.floor(Date.now() / 1000);
 
 let client;
 let currentQR = null;
 let isSessionFound = false;
 
-app.get('/', (req, res) => res.send("<html><body><h1>🟢 Alice System Online</h1></body></html>"));
+app.get('/', (req, res) => res.send("<html><body><h1>🟢 Alice Smart Forwarder</h1></body></html>"));
 
 // --- DATABASE & INITIALIZATION ---
 mongoose.connect(MONGO_URI).then(async () => {
     console.log('✅ Connected to MongoDB');
 
+    // Check for existing login file
     const db = mongoose.connection.db;
     const bucketCheck = await db.listCollections({ name: `whatsapp-RemoteAuth-${CLIENT_ID}.files` }).toArray();
 
     if (bucketCheck.length > 0) {
-        console.log(`🎉 FOUND EXISTING CREDENTIALS: "whatsapp-RemoteAuth-${CLIENT_ID}.files"`);
-        console.log("🚀 Auto-logging in...");
+        console.log(`🎉 FOUND EXISTING CREDENTIALS`);
         isSessionFound = true;
     } else {
-        console.log(`⚠️ NO CREDENTIALS FOUND. You must scan the QR code.`);
+        console.log(`⚠️ NO CREDENTIALS FOUND. Scan QR.`);
         isSessionFound = false;
     }
 
@@ -50,9 +48,6 @@ mongoose.connect(MONGO_URI).then(async () => {
             store: store, 
             backupSyncIntervalMs: 60000 
         }),
-        
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36',
-
         puppeteer: {
             executablePath: '/usr/bin/google-chrome-stable',
             headless: true,
@@ -67,65 +62,70 @@ mongoose.connect(MONGO_URI).then(async () => {
         }
     });
 
-    client.on('qr', (qr) => { 
-        console.log("📌 QR Code Generated");
-        currentQR = qr; 
-    });
-    
-    client.on('ready', () => { 
-        console.log('🚀 WhatsApp Ready!'); 
-        currentQR = "connected"; 
-    });
+    client.on('qr', (qr) => { console.log("📌 QR Generated"); currentQR = qr; });
+    client.on('ready', () => { console.log('🚀 Ready!'); currentQR = "connected"; });
 
     // --- INBOUND MESSAGES ---
     client.on('message', async (msg) => {
-        // 🛑 CRITICAL FIX: IGNORE STATUS UPDATES 🛑
-        // If we don't do this, the bot tries to reply to the status, which posts a NEW status on your profile.
+        // 1. IGNORE STATUS UPDATES (Safety First)
         if (msg.from === 'status@broadcast' || msg.isStatus) return;
 
-        // 🛑 SAFETY FIX: IGNORE OLD MESSAGES
+        // 2. IGNORE HISTORY
         if (msg.timestamp < BOOT_TIMESTAMP) return;
 
         if (!N8N_WEBHOOK) return;
         if (global.gc) global.gc();
 
-        const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
+        // 3. 🔍 ID RESOLVER (THE FIX)
+        // We fetch the contact info to get the REAL phone number, ignoring @lid
+        let realNumberId = msg.from;
+        let contactName = msg._data.notifyName || "Unknown";
         
-        // --- SAFE BLUE TICK LOGIC ---
+        try {
+            const contact = await msg.getContact();
+            if (contact && contact.number) {
+                // This converts "12345@lid" -> "919999999999@c.us"
+                realNumberId = contact.number + "@c.us";
+                contactName = contact.name || contact.pushname || contactName;
+            }
+        } catch (e) {
+            console.log("⚠️ Contact lookup failed, using original ID");
+        }
+
+        console.log(`📩 Resolved ID: ${realNumberId} (was ${msg.from})`);
+
+        // 4. BLUE TICK + TYPING (The Human Touch)
         try {
             const chat = await msg.getChat();
-            await chat.clearState(); // Reset "Typing"
+            await chat.clearState(); // Clear any stuck status
             
-            // Try Blue Tick (Safely)
-            await chat.sendSeen().catch(e => console.log("⚠️ Seen Skipped (Library Jam)"));
+            // Send Blue Tick
+            await chat.sendSeen().catch(() => {});
             
-            await new Promise(resolve => setTimeout(resolve, 300));
+            // Wait a tiny bit (human reaction time)
+            await new Promise(r => setTimeout(r, 300));
+            
+            // Start "Typing..." (This stays active while n8n thinks)
             await chat.sendStateTyping(); 
-        } catch (e) {
-            console.log("⚠️ Status Update Error:", e.message);
-        }
+        } catch (e) {}
 
         let attachment = null;
         if (msg.hasMedia) {
             try {
                 const media = await msg.downloadMedia();
                 if(media) {
-                    attachment = {
-                        mimetype: media.mimetype,
-                        data: media.data,
-                        filename: media.filename || "unknown_file"
-                    };
+                    attachment = { mimetype: media.mimetype, data: media.data, filename: media.filename || "file" };
                 }
             } catch (err) {}
         }
 
-        console.log(`📩 New Message from ${cleanFrom}`);
-        
+        // 🚀 SEND TO N8N
         try {
             await axios.post(N8N_WEBHOOK, {
-                from: msg.from,
+                from: realNumberId,     // The real number
+                original_id: msg.from,  // Backup ID
                 body: msg.body,
-                name: msg._data.notifyName || "Unknown",
+                name: contactName,
                 timestamp: msg.timestamp,
                 attachment: attachment
             });
@@ -135,18 +135,7 @@ mongoose.connect(MONGO_URI).then(async () => {
     client.initialize();
 });
 
-// --- API (SENDING) ---
-app.get('/connect', async (req, res) => {
-    if(req.query.password !== QR_PASSWORD) return res.status(403).send("⛔");
-    if(currentQR === "connected") return res.send("✅ Connected");
-    if(!currentQR) {
-        if(isSessionFound) return res.send("⏳ Loading session...");
-        return res.send("⏳ Booting...");
-    }
-    const qrImage = await QRCode.toDataURL(currentQR);
-    res.send(`<img src="${qrImage}" />`);
-});
-
+// --- API (OUTBOUND) ---
 app.post('/send', async (req, res) => {
     if(req.headers['authorization'] !== `Bearer ${QR_PASSWORD}`) return res.status(401).json({error: "Unauthorized"});
     let { number, message, attachment } = req.body;
@@ -154,10 +143,20 @@ app.post('/send', async (req, res) => {
 
     if (!number) return res.status(400).json({error: "No number provided"});
 
-    // ✅ STANDARD, ROBUST FORMATTING
     const chatId = number.includes('@') ? number : number.replace('+', '') + "@c.us";
-    
+
     try {
+        // 👇👇👇 OUTBOUND TYPING SIMULATION (Added Feature) 👇👇👇
+        const chat = await client.getChatById(chatId);
+        
+        // 1. Ensure "Typing..." is showing
+        await chat.sendStateTyping();
+        
+        // 2. Simulate "Writing Time" (1 second fixed delay for realism)
+        // This prevents the bot from replying INSTANTLY which looks robotic
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        // 👆👆👆 END SIMULATION 👆👆👆
+
         if (attachment && attachment.data) {
             let media = new MessageMedia(attachment.mimetype, attachment.data, attachment.filename);
             await client.sendMessage(chatId, media, { caption: message || "" });
@@ -165,11 +164,8 @@ app.post('/send', async (req, res) => {
             await client.sendMessage(chatId, message);
         }
         
-        // Cleanup state after sending
-        try {
-            const chat = await client.getChatById(chatId);
-            await chat.clearState(); 
-        } catch (e) {}
+        // 3. Stop Typing immediately after sending
+        await chat.clearState(); 
 
         res.json({status: "sent"});
     } catch(e) {
@@ -178,6 +174,14 @@ app.post('/send', async (req, res) => {
     } finally {
         if (global.gc) global.gc();
     }
+});
+
+app.get('/connect', async (req, res) => {
+    if(req.query.password !== QR_PASSWORD) return res.status(403).send("⛔");
+    if(currentQR === "connected") return res.send("✅ Connected");
+    if(!currentQR) return res.send("⏳ Booting...");
+    const qrImage = await QRCode.toDataURL(currentQR);
+    res.send(`<img src="${qrImage}" />`);
 });
 
 app.listen(PORT, () => console.log(`Server live on port ${PORT}`));
