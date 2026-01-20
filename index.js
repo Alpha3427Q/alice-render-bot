@@ -7,32 +7,49 @@ const axios = require('axios');
 const app = express();
 
 // --- CONFIGURATION ---
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ limit: '10mb', extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI;
-const QR_PASSWORD = process.env.QR_PASSWORD || "agartha_secret";
 const N8N_WEBHOOK = process.env.N8N_WEBHOOK;
+const QR_PASSWORD = process.env.QR_PASSWORD || "agartha_secret";
 
-// 🛡️ CRASH PROTECTION: Prevents the bot from dying during the "History Flood"
-let isSystemReady = false; 
+// 🔵 THE PERMANENT ID (Matches Termux)
+const CLIENT_ID = "Alice_Fresh_V1";
+// 🕒 TIMESTAMP: Ignore old messages to prevent Blue Tick crashes on startup
+const BOOT_TIMESTAMP = Math.floor(Date.now() / 1000);
 
 let client;
 let currentQR = null;
+let isSessionFound = false;
 
-app.get('/', (req, res) => res.send("<html><body><h1>🟢 System Online</h1></body></html>"));
+app.get('/', (req, res) => res.send("<html><body><h1>🟢 Alice System Online</h1></body></html>"));
 
-// --- DATABASE & CLIENT ---
-mongoose.connect(MONGO_URI).then(() => {
+// --- DATABASE & INITIALIZATION ---
+mongoose.connect(MONGO_URI).then(async () => {
     console.log('✅ Connected to MongoDB');
+
+    // 1. PRE-CHECK: Look for the file manually before starting
+    const db = mongoose.connection.db;
+    const existingSession = await db.collection('whatsapp-remote-auth-sessions').findOne({ _id: CLIENT_ID });
+
+    if (existingSession) {
+        console.log(`🎉 FOUND EXISTING CREDENTIALS for "${CLIENT_ID}". Auto-logging in...`);
+        isSessionFound = true;
+    } else {
+        console.log(`⚠️ NO CREDENTIALS FOUND for "${CLIENT_ID}". You must scan the QR code.`);
+        isSessionFound = false;
+    }
+
+    // 2. SETUP STORE & CLIENT
     const store = new MongoStore({ mongoose: mongoose });
 
     client = new Client({
         authStrategy: new RemoteAuth({ 
-            clientId: 'Alice_Typing_Only', // New ID for a fresh, clean start
+            clientId: CLIENT_ID, // Use this name for loading AND saving
             store: store, 
-            backupSyncIntervalMs: 60000 // Save session every 60s
+            backupSyncIntervalMs: 60000 // Save every 60s
         }),
         
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36',
@@ -60,45 +77,54 @@ mongoose.connect(MONGO_URI).then(() => {
         }
     });
 
+    // --- EVENTS ---
+
+    // QR Event: Only fires if session is missing or invalid
     client.on('qr', (qr) => { 
-        console.log("📌 QR Code Received");
+        console.log("📌 QR Code Generated (Session missing or invalid)");
         currentQR = qr; 
     });
 
+    // Save Event: confirm we are updating the DB
     client.on('remote_session_saved', () => {
-        console.log("💾 Session successfully saved to MongoDB!");
+        console.log("💾 Session Data Saved to MongoDB!");
     });
     
+    // Ready Event
     client.on('ready', () => { 
-        console.log('🚀 WhatsApp Ready! Starting Cool-down...'); 
+        console.log('🚀 WhatsApp Ready!'); 
         currentQR = "connected"; 
-        
-        // 👇 CRITICAL: Wait 30s before processing messages to prevent crash
-        setTimeout(() => {
-            isSystemReady = true;
-            console.log("✅ Cool-down complete. Bot is active.");
-        }, 30000); 
     });
 
-    // --- INBOUND MESSAGE HANDLING ---
+    // --- INBOUND MESSAGE HANDLING (Original Features Restored) ---
     client.on('message', async (msg) => {
-        // ⛔ Ignore messages during startup to save RAM
-        if (!isSystemReady) return;
+        // 1. Safety Filter: Ignore messages from before the server started
+        // This allows you to have Blue Ticks enabled without crashing on the "History Flood"
+        if (msg.timestamp < BOOT_TIMESTAMP) return;
 
         if (!N8N_WEBHOOK) return;
         if (global.gc) global.gc();
 
         const cleanFrom = msg.from.includes('@c.us') ? msg.from.replace('@c.us', '') : msg.from;
         
-        // --- TYPING STATUS ONLY (No Blue Tick) ---
+        // 2. BLUE TICKS & TYPING (Restored Feature)
         try {
             const chat = await msg.getChat();
-            await chat.clearState(); // Clear previous status
-            await chat.sendStateTyping(); // Start Typing...
-        } catch (e) {}
+            
+            // Wait slightly to feel human
+            await new Promise(resolve => setTimeout(resolve, 500));
+            await chat.sendSeen(); // 🔵 Blue Tick
+            
+            await new Promise(resolve => setTimeout(resolve, 300));
+            await chat.sendStateTyping(); // ✍️ Typing...
+            
+        } catch (e) {
+            console.log("⚠️ Status update failed (ignoring)");
+        }
 
         let attachment = null;
 
+        // 3. MEDIA HANDLING (Restored Feature)
         if (msg.hasMedia) {
             try {
                 const media = await msg.downloadMedia();
@@ -109,12 +135,12 @@ mongoose.connect(MONGO_URI).then(() => {
                         filename: media.filename || "unknown_file"
                     };
                 }
-                media = null;
             } catch (err) { console.error("Media Error:", err.message); }
         }
 
         console.log(`📩 New Message from ${cleanFrom}`);
         
+        // 4. SEND TO N8N (Restored Feature)
         try {
             await axios.post(N8N_WEBHOOK, {
                 from: msg.from,
@@ -123,7 +149,6 @@ mongoose.connect(MONGO_URI).then(() => {
                 timestamp: msg.timestamp,
                 attachment: attachment
             });
-            attachment = null;
         } catch(e) { console.error("Webhook Error:", e.message); }
     });
 
@@ -133,12 +158,23 @@ mongoose.connect(MONGO_URI).then(() => {
 // --- API ENDPOINTS ---
 app.get('/connect', async (req, res) => {
     if(req.query.password !== QR_PASSWORD) return res.status(403).send("⛔");
-    if(currentQR === "connected") return res.send("✅ Connected");
-    if(!currentQR) return res.send("⏳ Booting...");
+    
+    if(currentQR === "connected") return res.send("✅ Connected (Logged in via MongoDB)");
+    
+    if(!currentQR) {
+        if(isSessionFound) return res.send("⏳ Loading existing session from MongoDB...");
+        return res.send("⏳ Booting...");
+    }
     
     try {
         const qrImage = await QRCode.toDataURL(currentQR);
-        res.send(`<div style="display:flex;justify-content:center;align-items:center;height:100vh;"><img src="${qrImage}" style="width:300px;height:300px;border:5px solid black;"/></div>`);
+        res.send(`
+            <div style="display:flex;flex-direction:column;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;">
+                <h2>⚠️ No Saved Session Found</h2>
+                <p>Scan this to create "Alice_Fresh_V1"</p>
+                <img src="${qrImage}" style="width:300px;height:300px;border:5px solid black;"/>
+            </div>
+        `);
     } catch (e) { res.status(500).send("Error generating QR"); }
 });
 
@@ -160,7 +196,7 @@ app.post('/send', async (req, res) => {
             await client.sendMessage(chatId, message);
         }
         
-        // Stop "Typing..." after sending
+        // Stop typing after sending
         try {
             const chat = await client.getChatById(chatId);
             await chat.clearState(); 
