@@ -30,7 +30,6 @@ app.get('/', (req, res) => res.send("<html><body><h1>🟢 Alice System Online</h
 mongoose.connect(MONGO_URI).then(async () => {
     console.log('✅ Connected to MongoDB');
 
-    // 1. SMART CHECK: Look for the file bucket directly
     const db = mongoose.connection.db;
     const bucketCheck = await db.listCollections({ name: `whatsapp-RemoteAuth-${CLIENT_ID}.files` }).toArray();
 
@@ -80,7 +79,13 @@ mongoose.connect(MONGO_URI).then(async () => {
 
     // --- INBOUND MESSAGES ---
     client.on('message', async (msg) => {
+        // 🛑 CRITICAL FIX: IGNORE STATUS UPDATES 🛑
+        // If we don't do this, the bot tries to reply to the status, which posts a NEW status on your profile.
+        if (msg.from === 'status@broadcast' || msg.isStatus) return;
+
+        // 🛑 SAFETY FIX: IGNORE OLD MESSAGES
         if (msg.timestamp < BOOT_TIMESTAMP) return;
+
         if (!N8N_WEBHOOK) return;
         if (global.gc) global.gc();
 
@@ -92,7 +97,6 @@ mongoose.connect(MONGO_URI).then(async () => {
             await chat.clearState(); // Reset "Typing"
             
             // Try Blue Tick (Safely)
-            // If this fails/jams, it triggers the catch block but WON'T crash the bot
             await chat.sendSeen().catch(e => console.log("⚠️ Seen Skipped (Library Jam)"));
             
             await new Promise(resolve => setTimeout(resolve, 300));
