@@ -13,10 +13,10 @@ RUN apt-get update \
 # Setup App
 WORKDIR /usr/src/app
 
-# ⚠️ CHANGED: Copy patch-loader.js here so 'npm install' can find it
-COPY package*.json patch-loader.js ./
+# ✅ FIXED: Only copy package files (No patch-loader.js)
+COPY package*.json ./
 
-# This runs npm install AND the postinstall script (patch-loader.js)
+# Install dependencies
 RUN npm install
 
 # Copy the rest of your app (index.js, etc.)
