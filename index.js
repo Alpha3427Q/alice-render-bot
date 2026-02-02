@@ -4,6 +4,7 @@ const mongoose = require('mongoose');
 const express = require('express');
 const QRCode = require('qrcode');
 const axios = require('axios');
+const fs = require('fs'); // 🛠️ FIX: Import File System
 const app = express();
 
 // --- CONFIGURATION ---
@@ -15,7 +16,6 @@ const MONGO_URI = process.env.MONGO_URI;
 const N8N_WEBHOOK = process.env.N8N_WEBHOOK;
 const QR_PASSWORD = process.env.QR_PASSWORD || "agartha_secret";
 const CLIENT_ID = "Alice_Fresh_V1";
-// 🕒 TIMESTAMP: Safety filter for old messages
 const BOOT_TIMESTAMP = Math.floor(Date.now() / 1000);
 
 let client;
@@ -28,7 +28,6 @@ app.get('/', (req, res) => res.send("<html><body><h1>🟢 Alice Smart Forwarder<
 mongoose.connect(MONGO_URI).then(async () => {
     console.log('✅ Connected to MongoDB');
 
-    // Check for existing login file
     const db = mongoose.connection.db;
     const bucketCheck = await db.listCollections({ name: `whatsapp-RemoteAuth-${CLIENT_ID}.files` }).toArray();
 
@@ -40,13 +39,21 @@ mongoose.connect(MONGO_URI).then(async () => {
         isSessionFound = false;
     }
 
+    // 🛠️ FIX: Manually create the auth folder to prevent ENOENT crash
+    const AUTH_DIR = './.wwebjs_auth';
+    if (!fs.existsSync(AUTH_DIR)){
+        fs.mkdirSync(AUTH_DIR);
+        console.log("📂 Created missing auth directory.");
+    }
+
     const store = new MongoStore({ mongoose: mongoose });
 
     client = new Client({
-        authStrategy: new RemoteAuth({ 
-            clientId: CLIENT_ID, 
-            store: store, 
-            backupSyncIntervalMs: 60000 
+        authStrategy: new RemoteAuth({
+            clientId: CLIENT_ID,
+            store: store,
+            dataPath: AUTH_DIR, // 🛠️ FIX: Explicitly set the path
+            backupSyncIntervalMs: 60000
         }),
         puppeteer: {
             executablePath: '/usr/bin/google-chrome-stable',
@@ -55,7 +62,7 @@ mongoose.connect(MONGO_URI).then(async () => {
                 '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
                 '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
                 '--single-process', '--disable-gpu', '--disable-extensions',
-                '--mute-audio', '--disable-features=site-per-process', 
+                '--mute-audio', '--disable-features=site-per-process',
                 '--window-size=800,600'
             ],
             timeout: 60000
@@ -67,76 +74,50 @@ mongoose.connect(MONGO_URI).then(async () => {
 
     // --- INBOUND MESSAGES ---
     client.on('message', async (msg) => {
-        // 1. IGNORE STATUS UPDATES
         if (msg.from === 'status@broadcast' || msg.isStatus) return;
-
-        // 2. IGNORE HISTORY
         if (msg.timestamp < BOOT_TIMESTAMP) return;
 
         if (!N8N_WEBHOOK) return;
         if (global.gc) global.gc();
 
-        // 3. 🔍 ID & NAME RESOLVER (UPDATED)
         let realNumberId = msg.from;
-        // Default to the name in the message packet
-        let displayName = msg._data.notifyName || "Unknown"; 
+        let displayName = msg._data.notifyName || "Unknown";
         let publicPushname = msg._data.notifyName || "Unknown";
-        
+
         try {
             const contact = await msg.getContact();
             if (contact) {
-                // A. ID FIX: Get real number from contact profile
-                if (contact.number) {
-                    realNumberId = contact.number + "@c.us";
-                }
-
-                // B. NAME FIX: 
-                // 'contact.pushname' = The name THEY set (e.g. "Gamer123")
-                // 'contact.name' = The name YOU saved (e.g. "Rahul Work")
-                
-                if (contact.pushname) {
-                    publicPushname = contact.pushname;
-                }
-
-                // Logic: If you saved a name, use it. Otherwise use their public name.
+                if (contact.number) realNumberId = contact.number + "@c.us";
+                if (contact.pushname) publicPushname = contact.pushname;
                 displayName = contact.name || contact.pushname || displayName;
             }
-        } catch (e) {
-            console.log("⚠️ Contact lookup failed, using defaults");
-        }
+        } catch (e) { console.log("⚠️ Contact lookup failed"); }
 
         console.log(`📩 Resolved: ${displayName} (${realNumberId})`);
 
-        // 4. HUMAN BEHAVIOR (Blue Tick + Typing)
         try {
             const chat = await msg.getChat();
             await chat.clearState();
             await chat.sendSeen().catch(() => {});
             await new Promise(r => setTimeout(r, 300));
-            await chat.sendStateTyping(); 
+            await chat.sendStateTyping();
         } catch (e) {}
 
         let attachment = null;
         if (msg.hasMedia) {
             try {
                 const media = await msg.downloadMedia();
-                if(media) {
-                    attachment = { mimetype: media.mimetype, data: media.data, filename: media.filename || "file" };
-                }
+                if(media) attachment = { mimetype: media.mimetype, data: media.data, filename: media.filename || "file" };
             } catch (err) {}
         }
 
-        // 🚀 SEND TO N8N (With NEW 'username' field)
         try {
             await axios.post(N8N_WEBHOOK, {
-                from: realNumberId,      // Real Number (@c.us)
-                original_id: msg.from,   // Raw ID (Backup)
+                from: realNumberId,
+                original_id: msg.from,
                 body: msg.body,
-                
-                // 👇 THIS IS THE NEW PART 👇
-                name: displayName,       // Best Name (Prioritizes your phonebook)
-                username: publicPushname,// Public Name (What they call themselves)
-                
+                name: displayName,
+                username: publicPushname,
                 timestamp: msg.timestamp,
                 attachment: attachment
             });
@@ -150,18 +131,16 @@ mongoose.connect(MONGO_URI).then(async () => {
 app.post('/send', async (req, res) => {
     if(req.headers['authorization'] !== `Bearer ${QR_PASSWORD}`) return res.status(401).json({error: "Unauthorized"});
     let { number, message, attachment } = req.body;
-    req.body = null; 
+    req.body = null;
 
     if (!number) return res.status(400).json({error: "No number provided"});
 
     const chatId = number.includes('@') ? number : number.replace('+', '') + "@c.us";
 
     try {
-        // 👇 OUTBOUND TYPING SIMULATION 👇
         const chat = await client.getChatById(chatId);
         await chat.sendStateTyping();
-        await new Promise(resolve => setTimeout(resolve, 1000)); // 1s typing delay
-        // 👆 END SIMULATION 👆
+        await new Promise(resolve => setTimeout(resolve, 1000));
 
         if (attachment && attachment.data) {
             let media = new MessageMedia(attachment.mimetype, attachment.data, attachment.filename);
@@ -169,9 +148,8 @@ app.post('/send', async (req, res) => {
         } else {
             await client.sendMessage(chatId, message);
         }
-        
-        await chat.clearState(); 
 
+        await chat.clearState();
         res.json({status: "sent"});
     } catch(e) {
         console.error("❌ Send Error:", e.message);
