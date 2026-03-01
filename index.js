@@ -5,7 +5,8 @@ const {
     BufferJSON,
     downloadMediaMessage,
     delay,
-    fetchLatestWaWebVersion
+    fetchLatestWaWebVersion,
+    makeCacheableSignalKeyStore // 🛡️ Prevents MongoDB crash & connection loops
 } = require('@whiskeysockets/baileys');
 const mongoose = require('mongoose');
 const express = require('express');
@@ -60,33 +61,37 @@ async function useMongoDBAuthState(collectionName) {
 
     const creds = (await readData('creds')) || initAuthCreds();
 
+    // 🛡️ RAW KEYS BEFORE CACHING
+    const rawKeys = {
+        get: async (type, ids) => {
+            const data = {};
+            await Promise.all(ids.map(async id => {
+                let value = await readData(`${type}-${id}`);
+                if (type === 'app-state-sync-key' && value) {
+                    value = makeWASocket.authStateCreator.appStateSyncKey(value);
+                }
+                data[id] = value;
+            }));
+            return data;
+        },
+        set: async (data) => {
+            const tasks = [];
+            for (const category in data) {
+                for (const id in data[category]) {
+                    const value = data[category][id];
+                    const name = `${category}-${id}`;
+                    tasks.push(value ? writeData(value, name) : removeData(name));
+                }
+            }
+            await Promise.all(tasks);
+        }
+    };
+
     return {
         state: {
             creds,
-            keys: {
-                get: async (type, ids) => {
-                    const data = {};
-                    await Promise.all(ids.map(async id => {
-                        let value = await readData(`${type}-${id}`);
-                        if (type === 'app-state-sync-key' && value) {
-                            value = makeWASocket.authStateCreator.appStateSyncKey(value);
-                        }
-                        data[id] = value;
-                    }));
-                    return data;
-                },
-                set: async (data) => {
-                    const tasks = [];
-                    for (const category in data) {
-                        for (const id in data[category]) {
-                            const value = data[category][id];
-                            const name = `${category}-${id}`;
-                            tasks.push(value ? writeData(value, name) : removeData(name));
-                        }
-                    }
-                    await Promise.all(tasks);
-                }
-            }
+            // 🛡️ SHOCK ABSORBER: Caches keys in RAM to prevent DB overload during sync
+            keys: makeCacheableSignalKeyStore(rawKeys, pino({ level: 'silent' })) 
         },
         saveCreds: () => writeData(creds, 'creds')
     };
@@ -101,6 +106,7 @@ mongoose.connect(MONGO_URI).then(async () => {
 async function startWhatsApp() {
     const { state, saveCreds } = await useMongoDBAuthState(CLIENT_ID);
 
+    // 🛡️ DYNAMIC VERSION FETCHING
     let waVersion = [2, 3000, 1015901307]; 
     try {
         const { version, isLatest } = await fetchLatestWaWebVersion();
@@ -113,7 +119,7 @@ async function startWhatsApp() {
     sock = makeWASocket({
         version: waVersion,
         auth: state,
-        logger: pino({ level: 'silent' }), 
+        logger: pino({ level: 'silent' }), // 🤫 Silent to save memory
         printQRInTerminal: false,
         browser: ["Alice Smart Forwarder", "Chrome", "1.0.0"],
         markOnlineOnConnect: true
@@ -132,7 +138,7 @@ async function startWhatsApp() {
         if (connection === 'close') {
             currentQR = null;
             const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            originalLog('⚠️ Connection closed. Reconnecting:', shouldReconnect);
+            originalLog('⚠️ Connection closed due to:', lastDisconnect.error?.message || lastDisconnect.error, 'Reconnecting:', shouldReconnect);
             
             if (shouldReconnect) {
                 setTimeout(() => startWhatsApp(), 3000);
@@ -156,30 +162,27 @@ async function startWhatsApp() {
         if (originalJid === 'status@broadcast') return;
         if (!N8N_WEBHOOK) return;
 
-        // ⏱️ FILTER: Only process messages from the last 24 hours
+        // ⏱️ FILTER: Only process messages from the last 24 hours (No boot-up spam)
         const ONE_DAY_AGO = Math.floor(Date.now() / 1000) - (24 * 60 * 60);
         if (msg.messageTimestamp < ONE_DAY_AGO) return; 
 
+        // 🧹 RAM CLEAR
         if (global.gc) global.gc();
 
-        // 🧠 THE LID RESOLVER: Hunt down the real phone number from hidden properties
+        // 🧠 THE LID RESOLVER: Hunt down the real phone number
         let lid = originalJid.includes('@lid') ? originalJid : (msg.key.participant?.includes('@lid') ? msg.key.participant : null);
         let pn = originalJid.includes('s.whatsapp.net') ? originalJid : null;
         
-        // Dig into Baileys v7 alternate properties
         if (!pn && msg.key.remoteJidAlt?.includes('s.whatsapp.net')) pn = msg.key.remoteJidAlt;
         if (!pn && msg.key.participantAlt?.includes('s.whatsapp.net')) pn = msg.key.participantAlt;
         if (!pn && msg.key.senderPn) pn = msg.key.senderPn;
-        if (!pn) pn = originalJid; // Absolute fallback
+        if (!pn) pn = originalJid; 
 
-        // Link the real phone number to the LID in memory so our n8n reply routes correctly
         if (lid && pn.includes('s.whatsapp.net')) {
             const basePn = pn.split('@')[0];
             jidMap.set(basePn, lid);
-            originalLog(`🔗 Mapped LID ${lid} to Real Number ${basePn}`);
         }
 
-        // Format to @c.us for n8n compatibility (n8n will now see the REAL phone number)
         let realNumberId = pn.replace(/@(s\.whatsapp\.net|lid)/, '@c.us');
         let displayName = msg.pushName || "Unknown";
         let body = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
@@ -187,7 +190,6 @@ async function startWhatsApp() {
         originalLog(`📩 Received from: ${displayName} (${realNumberId})`);
 
         try {
-            // NOTE: WhatsApp requires us to use the original JID for state updates, even if it's a LID
             await sock.readMessages([msg.key]); 
             await delay(300);
             await sock.sendPresenceUpdate('composing', originalJid); 
@@ -198,7 +200,8 @@ async function startWhatsApp() {
         let attachment = null;
         const messageType = Object.keys(msg.message)[0];
         
-        if (['imageMessage', 'videoMessage', 'documentMessage'].includes(messageType)) {
+        // 🎙️ UPDATED: Added audioMessage to be downloaded to n8n
+        if (['imageMessage', 'videoMessage', 'documentMessage', 'audioMessage'].includes(messageType)) {
             try {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                 const mediaMsg = msg.message[messageType];
@@ -206,7 +209,7 @@ async function startWhatsApp() {
                 attachment = {
                     mimetype: mediaMsg.mimetype,
                     data: buffer.toString('base64'),
-                    filename: mediaMsg.fileName || "file"
+                    filename: mediaMsg.fileName || (messageType === 'audioMessage' ? 'audio.ogg' : 'file')
                 };
                 if (!body) body = mediaMsg.caption || ""; 
             } catch (err) {
@@ -232,7 +235,7 @@ async function startWhatsApp() {
     });
 }
 
-// --- API (OUTBOUND MESSAGES) ---
+// --- API (OUTBOUND MESSAGES FROM N8N) ---
 app.post('/send', async (req, res) => {
     if(req.headers['authorization'] !== `Bearer ${QR_PASSWORD}`) return res.status(401).json({error: "Unauthorized"});
     
@@ -241,31 +244,42 @@ app.post('/send', async (req, res) => {
 
     if (!number) return res.status(400).json({error: "No number provided"});
 
-    // 🧠 CACHE CHECK: Map n8n's @c.us back to the WhatsApp @lid if necessary
     const baseNumber = number.replace('@c.us', '').replace('+', '');
     let jid = jidMap.has(baseNumber) ? jidMap.get(baseNumber) : baseNumber + "@s.whatsapp.net";
 
     try {
-        await sock.sendPresenceUpdate('composing', jid);
-        await delay(1000);
-
         let sendPayload = {};
 
         if (attachment && attachment.data) {
             const buffer = Buffer.from(attachment.data, 'base64');
             const isImage = attachment.mimetype.includes('image');
             const isVideo = attachment.mimetype.includes('video');
+            const isAudio = attachment.mimetype.includes('audio') || attachment.mimetype.includes('ogg'); // 🎙️ Check for audio
 
             if (isImage) {
                 sendPayload = { image: buffer, caption: message || "", mimetype: attachment.mimetype };
+                await sock.sendPresenceUpdate('composing', jid);
             } else if (isVideo) {
                 sendPayload = { video: buffer, caption: message || "", mimetype: attachment.mimetype };
+                await sock.sendPresenceUpdate('composing', jid);
+            } else if (isAudio) {
+                // 🎙️ UPDATED: Send as a Voice Note (PTT)
+                sendPayload = { 
+                    audio: buffer, 
+                    mimetype: 'audio/ogg; codecs=opus', 
+                    ptt: true // This is the magic flag that makes it a voice note
+                };
+                await sock.sendPresenceUpdate('recording', jid); // Show "recording audio..." instead of "typing..."
             } else {
                 sendPayload = { document: buffer, caption: message || "", mimetype: attachment.mimetype, fileName: attachment.filename || "document" };
+                await sock.sendPresenceUpdate('composing', jid);
             }
         } else {
             sendPayload = { text: message || "" };
+            await sock.sendPresenceUpdate('composing', jid);
         }
+
+        await delay(1000); // Human-like delay
 
         await sock.sendMessage(jid, sendPayload);
         await sock.sendPresenceUpdate('paused', jid); 
