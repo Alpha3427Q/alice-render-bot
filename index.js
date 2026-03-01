@@ -5,13 +5,20 @@ const {
     BufferJSON,
     downloadMediaMessage,
     delay,
-    fetchLatestWaWebVersion // Standard export for fetching the latest version
+    fetchLatestWaWebVersion
 } = require('@whiskeysockets/baileys');
 const mongoose = require('mongoose');
 const express = require('express');
 const QRCode = require('qrcode');
 const axios = require('axios');
 const pino = require('pino');
+
+// --- HIDE NOISY LIBSIGNAL LOGS ---
+const originalLog = console.log;
+console.log = function() {
+    if (arguments[0] && typeof arguments[0] === 'string' && arguments[0].includes('Closing session: SessionEntry')) return;
+    originalLog.apply(console, arguments);
+};
 
 const app = express();
 
@@ -24,14 +31,16 @@ const MONGO_URI = process.env.MONGO_URI;
 const N8N_WEBHOOK = process.env.N8N_WEBHOOK;
 const QR_PASSWORD = process.env.QR_PASSWORD || "agartha_secret";
 const CLIENT_ID = process.env.CLIENT_ID || "Alice_Fresh_V1";
-const BOOT_TIMESTAMP = Math.floor(Date.now() / 1000);
 
 let sock;
 let currentQR = null;
 
+// Memory cache to map n8n @c.us replies back to WhatsApp @lid addresses
+const jidMap = new Map();
+
 app.get('/', (req, res) => res.send("<html><body><h1>🟢 Alice Smart Forwarder (Baileys Engine v7)</h1></body></html>"));
 
-// --- MONGODB AUTH STATE FOR BAILEYS ---
+// --- MONGODB AUTH STATE ---
 const AuthSchema = new mongoose.Schema({ _id: String, data: String }, { strict: false });
 const AuthModel = mongoose.model('BaileysAuth', AuthSchema);
 
@@ -85,27 +94,26 @@ async function useMongoDBAuthState(collectionName) {
 
 // --- INITIALIZATION ---
 mongoose.connect(MONGO_URI).then(async () => {
-    console.log('✅ Connected to MongoDB');
+    originalLog('✅ Connected to MongoDB');
     startWhatsApp();
 });
 
 async function startWhatsApp() {
     const { state, saveCreds } = await useMongoDBAuthState(CLIENT_ID);
 
-    // 🛡️ DYNAMIC VERSION FETCHING
     let waVersion = [2, 3000, 1015901307]; 
     try {
         const { version, isLatest } = await fetchLatestWaWebVersion();
         waVersion = version;
-        console.log(`📡 Using WA Web v${version.join('.')}, isLatest: ${isLatest}`);
+        originalLog(`📡 Using WA Web v${version.join('.')}, isLatest: ${isLatest}`);
     } catch (e) {
-        console.log(`⚠️ Failed to fetch latest WA version, using fallback: v${waVersion.join('.')}`);
+        originalLog(`⚠️ Failed to fetch latest WA version, using fallback: v${waVersion.join('.')}`);
     }
 
     sock = makeWASocket({
         version: waVersion,
         auth: state,
-        logger: pino({ level: 'silent' }), // Keeps logs quiet for memory
+        logger: pino({ level: 'silent' }), 
         printQRInTerminal: false,
         browser: ["Alice Smart Forwarder", "Chrome", "1.0.0"],
         markOnlineOnConnect: true
@@ -117,60 +125,76 @@ async function startWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log("📌 QR Generated");
+            originalLog("📌 QR Generated");
             currentQR = qr;
         }
 
         if (connection === 'close') {
             currentQR = null;
             const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('⚠️ Connection closed. Reconnecting:', shouldReconnect);
+            originalLog('⚠️ Connection closed. Reconnecting:', shouldReconnect);
             
             if (shouldReconnect) {
                 setTimeout(() => startWhatsApp(), 3000);
             } else {
-                console.log('❌ Logged out from WhatsApp. Clear MongoDB to scan new QR.');
+                originalLog('❌ Logged out from WhatsApp. Clear MongoDB to scan new QR.');
             }
         } else if (connection === 'open') {
-            console.log('🚀 Ready! Connected to WhatsApp.');
+            originalLog('🚀 Ready! Connected to WhatsApp.');
             currentQR = "connected";
         }
     });
 
-    // --- INBOUND MESSAGES (WEBHOOK TRIGGER) ---
+    // --- INBOUND MESSAGES ---
     sock.ev.on('messages.upsert', async (m) => {
-        if (m.type !== 'notify') return;
+        if (m.type !== 'notify') return; 
         
         const msg = m.messages[0];
         if (!msg.message || msg.key.fromMe) return;
 
-        const remoteJid = msg.key.remoteJid;
-        if (remoteJid === 'status@broadcast') return;
-        if (msg.messageTimestamp < BOOT_TIMESTAMP) return; 
+        const originalJid = msg.key.remoteJid;
+        if (originalJid === 'status@broadcast') return;
         if (!N8N_WEBHOOK) return;
 
-        // Force Garbage Collection to keep RAM low
+        // ⏱️ FILTER: Only process messages from the last 24 hours
+        const ONE_DAY_AGO = Math.floor(Date.now() / 1000) - (24 * 60 * 60);
+        if (msg.messageTimestamp < ONE_DAY_AGO) return; 
+
         if (global.gc) global.gc();
 
-        // Emulate your exact old variables for n8n payload
-        let realNumberId = remoteJid.replace('@s.whatsapp.net', '@c.us');
-        let displayName = msg.pushName || "Unknown";
+        // 🧠 THE LID RESOLVER: Hunt down the real phone number from hidden properties
+        let lid = originalJid.includes('@lid') ? originalJid : (msg.key.participant?.includes('@lid') ? msg.key.participant : null);
+        let pn = originalJid.includes('s.whatsapp.net') ? originalJid : null;
         
-        // Extract text
+        // Dig into Baileys v7 alternate properties
+        if (!pn && msg.key.remoteJidAlt?.includes('s.whatsapp.net')) pn = msg.key.remoteJidAlt;
+        if (!pn && msg.key.participantAlt?.includes('s.whatsapp.net')) pn = msg.key.participantAlt;
+        if (!pn && msg.key.senderPn) pn = msg.key.senderPn;
+        if (!pn) pn = originalJid; // Absolute fallback
+
+        // Link the real phone number to the LID in memory so our n8n reply routes correctly
+        if (lid && pn.includes('s.whatsapp.net')) {
+            const basePn = pn.split('@')[0];
+            jidMap.set(basePn, lid);
+            originalLog(`🔗 Mapped LID ${lid} to Real Number ${basePn}`);
+        }
+
+        // Format to @c.us for n8n compatibility (n8n will now see the REAL phone number)
+        let realNumberId = pn.replace(/@(s\.whatsapp\.net|lid)/, '@c.us');
+        let displayName = msg.pushName || "Unknown";
         let body = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
 
-        console.log(`📩 Received from: ${displayName} (${realNumberId})`);
+        originalLog(`📩 Received from: ${displayName} (${realNumberId})`);
 
         try {
-            // Human-like behavior matching your old wwebjs script
-            await sock.readMessages([msg.key]); // Send Seen
+            // NOTE: WhatsApp requires us to use the original JID for state updates, even if it's a LID
+            await sock.readMessages([msg.key]); 
             await delay(300);
-            await sock.sendPresenceUpdate('composing', remoteJid); // State Typing
+            await sock.sendPresenceUpdate('composing', originalJid); 
             await delay(1000); 
-            await sock.sendPresenceUpdate('paused', remoteJid); // Clear State
+            await sock.sendPresenceUpdate('paused', originalJid); 
         } catch (e) {}
 
-        // Handle Media/Attachments
         let attachment = null;
         const messageType = Object.keys(msg.message)[0];
         
@@ -184,18 +208,16 @@ async function startWhatsApp() {
                     data: buffer.toString('base64'),
                     filename: mediaMsg.fileName || "file"
                 };
-                
-                // Fallback text body to caption if no regular body exists
                 if (!body) body = mediaMsg.caption || ""; 
             } catch (err) {
-                console.error("⚠️ Media download failed", err.message);
+                originalLog("⚠️ Media download failed", err.message);
             }
         }
 
         try {
             await axios.post(N8N_WEBHOOK, {
                 from: realNumberId,
-                original_id: remoteJid, // Keep the actual string for your records
+                original_id: originalJid, 
                 body: body,
                 name: displayName,
                 username: displayName,
@@ -203,14 +225,14 @@ async function startWhatsApp() {
                 attachment: attachment
             });
         } catch(e) { 
-            console.error("❌ Webhook Error:", e.message); 
+            originalLog("❌ Webhook Error:", e.message); 
         } finally {
-            if (global.gc) global.gc(); // Clean up memory after webhook post
+            if (global.gc) global.gc(); 
         }
     });
 }
 
-// --- API (OUTBOUND MESSAGES FROM N8N) ---
+// --- API (OUTBOUND MESSAGES) ---
 app.post('/send', async (req, res) => {
     if(req.headers['authorization'] !== `Bearer ${QR_PASSWORD}`) return res.status(401).json({error: "Unauthorized"});
     
@@ -219,11 +241,11 @@ app.post('/send', async (req, res) => {
 
     if (!number) return res.status(400).json({error: "No number provided"});
 
-    // Format legacy n8n @c.us format back to Baileys @s.whatsapp.net format
-    const jid = number.includes('@') ? number.replace('@c.us', '@s.whatsapp.net') : number.replace('+', '') + "@s.whatsapp.net";
+    // 🧠 CACHE CHECK: Map n8n's @c.us back to the WhatsApp @lid if necessary
+    const baseNumber = number.replace('@c.us', '').replace('+', '');
+    let jid = jidMap.has(baseNumber) ? jidMap.get(baseNumber) : baseNumber + "@s.whatsapp.net";
 
     try {
-        // Human-like typing delay
         await sock.sendPresenceUpdate('composing', jid);
         await delay(1000);
 
@@ -250,10 +272,10 @@ app.post('/send', async (req, res) => {
 
         res.json({status: "sent"});
     } catch(e) {
-        console.error("❌ Send Error:", e.message);
+        originalLog("❌ Send Error:", e.message);
         res.status(500).json({error: e.toString()});
     } finally {
-        if (global.gc) global.gc(); // Free memory immediately after sending
+        if (global.gc) global.gc(); 
     }
 });
 
@@ -265,4 +287,4 @@ app.get('/connect', async (req, res) => {
     res.send(`<img src="${qrImage}" />`);
 });
 
-app.listen(PORT, () => console.log(`🚀 Server live on port ${PORT}`));
+app.listen(PORT, () => originalLog(`🚀 Server live on port ${PORT}`));
