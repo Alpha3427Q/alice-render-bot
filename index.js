@@ -300,5 +300,13 @@ app.get('/connect', async (req, res) => {
     const qrImage = await QRCode.toDataURL(currentQR);
     res.send(`<img src="${qrImage}" />`);
 });
+// --- GRACEFUL SHUTDOWN FOR RENDER DEPLOYMENTS ---
+process.on('SIGTERM', () => {
+    console.log('🛑 Render deployment detected! Closing old WhatsApp connection safely...');
+    if (sock) {
+        sock.ws.close(); 
+    }
+    setTimeout(() => process.exit(0), 500); 
+});
 
 app.listen(PORT, () => originalLog(`🚀 Server live on port ${PORT}`));
