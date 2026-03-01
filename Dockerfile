@@ -1,4 +1,4 @@
-FROM node:18-slim
+FROM node:20-slim
 
 # Install git (required by npm for fetching some dependencies)
 RUN apt-get update && \
